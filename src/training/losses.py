@@ -31,11 +31,13 @@ def selection_entropy_loss(alpha_raw: jax.Array) -> jax.Array:
     return 1.0 - entropy / max_entropy
 
 
-def diversity_loss(sims: jax.Array, alpha: jax.Array, idx: jax.Array) -> jax.Array:
+def diversity_loss(sims: jax.Array, alpha: jax.Array, idx) -> jax.Array:
     """
     Prevent key collapse: penalize high average similarity among retrieved vectors.
-    Handles (batch, N/k_max) or (batch, seq, N/k_max) by flattening to 2D.
+    Returns 0 in soft mode (idx=None) — all N vectors are active, collapse impossible.
     """
+    if idx is None:
+        return jnp.array(0.0)
     N = sims.shape[-1]
     k = idx.shape[-1]
     sims_2d  = sims.reshape(-1, N)
@@ -61,7 +63,7 @@ def sparsity_loss(alpha: jax.Array) -> jax.Array:
 def compute_aux_losses(
     model,
     alpha: jax.Array,
-    idx: jax.Array,
+    idx,                      # (batch, [seq,] k_max) in hard mode; None in soft mode
     sims: jax.Array,
     alpha_raw: jax.Array,
     lambda_entropy_eff: float = 0.0,

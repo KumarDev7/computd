@@ -50,3 +50,9 @@ class DWAConfig:
     n_heads: int = 0
     max_seq_len: int = 256
     n_assembly_layers: int = 1
+
+    # --- Training mode ---
+    # soft_train=True  → soft dense pool (all N vectors, GEMMs only, TPU-optimal)
+    # soft_train=False → hard top-k + gather (current GPU mode)
+    # Same checkpoint works for both; switch this flag between training and inference.
+    soft_train: bool = False

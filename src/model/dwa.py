@@ -11,44 +11,43 @@ from .assembly import WeightAssembler
 def _retrieve_per_position(z, retrieval_module, pool_vectors, k_max, T, lambda_sharp,
                             use_sigmoid, forced_idx):
     """
-    Wraps MultiAspectRetrieval to handle per-position (3D) inputs.
+    Sequence-level retrieval (3D input) or direct retrieval (2D input).
 
-    If z is 3D (batch, seq, d_A): flattens to (batch*seq, d_A), runs retrieval,
-    reshapes back. forced_idx is cyclically rotated per position so that across
-    seq positions the full pool is covered.
+    3D path — sequence-level retrieval (fast):
+      • One retrieval query per sequence (mean of per-position z).
+      • idx: (batch, k_max) — shared across all positions in the sequence.
+      • Gather: (batch, k_max, D) — 256× smaller than the old per-position gather.
+      • alpha: (batch, seq, k_max) — per-position weights computed cheaply against
+        only the k selected vectors (no N-wide scan per position).
 
-    Returns alpha, idx, sims, alpha_raw with shape (batch, seq, ...) when 3D input,
-    or (batch, ...) when 2D input.
+    2D path — direct retrieval, unchanged.
     """
     if z.ndim == 3:
-        batch, seq, d_A = z.shape
-        N = pool_vectors.shape[0]
-        z_flat = z.reshape(batch * seq, d_A)
+        batch, seq, _ = z.shape
 
-        if forced_idx is not None:
-            # Per-position cyclic rotation using repeat+tile (avoids XLA layout issues).
-            # Each position t gets forced_idx + t (mod N) so the full pool is
-            # covered in one phase-1 step (seq=64 × k_max=8 = 512 = N).
-            repeated = jnp.repeat(forced_idx, seq, axis=0)               # (batch*seq, k_max)
-            offsets  = jnp.tile(jnp.arange(seq, dtype=jnp.int32), batch)[:, None]  # (batch*seq, 1)
-            forced_flat = (repeated + offsets) % N
-        else:
-            forced_flat = None
+        # Sequence-level query: mean over positions → one retrieval per sequence
+        z_seq = z.mean(axis=1)  # (batch, d_A)
 
-        alpha_f, idx_f, sims_f, alpha_raw_f = retrieval_module(
-            z=z_flat,
+        alpha_seq, idx, sims, alpha_raw = retrieval_module(
+            z=z_seq,
             vectors=pool_vectors,
             k_max=k_max,
             T=T,
             lambda_sharp=lambda_sharp,
             use_sigmoid=use_sigmoid,
-            forced_idx=forced_flat,
+            forced_idx=forced_idx,   # (batch, k_max) — same shape, no expansion needed
         )
+        # idx: (batch, k_max), sims: (batch, N)
 
-        alpha     = alpha_f.reshape(batch, seq, k_max)
-        idx       = idx_f.reshape(batch, seq, k_max)
-        sims      = sims_f.reshape(batch, seq, N)
-        alpha_raw = alpha_raw_f.reshape(batch, seq, N)
+        if use_sigmoid:
+            # Per-position alpha: re-score each position against only the k retrieved vectors.
+            # Tiny gather (batch, k_max, D) instead of (batch, seq, k_max, D).
+            selected_vecs = pool_vectors[idx]                               # (batch, k_max, D)
+            alpha = retrieval_module.per_position_alpha(z, selected_vecs)  # (batch, seq, k_max)
+        else:
+            # Phase-1 warmup: uniform alpha, broadcast across positions
+            alpha = jnp.broadcast_to(alpha_seq[:, None, :], (batch, seq, k_max))
+
         return alpha, idx, sims, alpha_raw
     else:
         return retrieval_module(
@@ -77,13 +76,23 @@ class DWABlock(nnx.Module):
         self.retrieval  = MultiAspectRetrieval(D=D, d_A=d_model, S=S, d_k=d_k, N=N, rngs=rngs)
         self.assembler  = WeightAssembler(d_model, d_model, r, rngs=rngs)
 
-    def __call__(self, h, pool_vectors, k_max, T, lambda_sharp, use_sigmoid, forced_idx=None):
+    def __call__(self, h, pool_vectors, k_max, T, lambda_sharp, use_sigmoid,
+                 forced_idx=None, soft=False):
         if self.n_heads > 0:
             h = self.attn(h)
         z = self.query_proj(h)
-        alpha, idx, sims, alpha_raw = _retrieve_per_position(
-            z, self.retrieval, pool_vectors, k_max, T, lambda_sharp, use_sigmoid, forced_idx
-        )
+
+        if soft and z.ndim == 3:
+            # Soft mode: all N vectors, pure GEMMs, no gather, no top-k.
+            alpha, sims, alpha_raw = self.retrieval.soft_forward(
+                z, pool_vectors, T, lambda_sharp, use_sigmoid
+            )
+            idx = None  # no discrete selection in soft mode
+        else:
+            alpha, idx, sims, alpha_raw = _retrieve_per_position(
+                z, self.retrieval, pool_vectors, k_max, T, lambda_sharp, use_sigmoid, forced_idx
+            )
+
         h_out = self.assembler(h, alpha, idx, pool_vectors)
         return h_out, alpha, idx, sims, alpha_raw
 
@@ -120,6 +129,7 @@ class DWAModel(nnx.Module):
         lambda_sharp: float = 1.0,
         return_aux: bool = False,
         forced_idx: jax.Array | None = None,  # (batch, k_max) for phase-1 warmup
+        soft: bool = False,                    # True → soft dense pool (TPU training)
     ):
         cfg       = self.config
         pool_vecs = self.pool.vectors.value
@@ -129,7 +139,8 @@ class DWAModel(nnx.Module):
         alpha_list, idx_list, sims_list, alpha_raw_list = [], [], [], []
         for block in self.blocks:
             h, alpha, idx, sims, alpha_raw = block(
-                h, pool_vecs, cfg.k_max, cfg.T, lambda_sharp, use_sigmoid, forced_idx
+                h, pool_vecs, cfg.k_max, cfg.T, lambda_sharp, use_sigmoid, forced_idx,
+                soft=soft,
             )
             alpha_list.append(alpha)
             idx_list.append(idx)

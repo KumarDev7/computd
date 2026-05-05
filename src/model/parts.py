@@ -39,8 +39,9 @@ class CausalSelfAttention(nnx.Module):
         self.proj = nnx.Linear(d_model, d_model, use_bias=False, rngs=rngs)
         self.norm = nnx.LayerNorm(d_model, rngs=rngs)
 
-        # Pre-compute RoPE frequencies (static — not a parameter)
+        # Pre-compute RoPE frequencies and causal mask (static — not parameters)
         self._freqs = _rope_freqs(self.d_head, max_seq_len)
+        self._mask  = jnp.tril(jnp.ones((max_seq_len, max_seq_len), dtype=bool))
 
     def __call__(self, x: jax.Array) -> jax.Array:
         """x: (batch, seq, d_model) → (batch, seq, d_model)"""
@@ -57,10 +58,9 @@ class CausalSelfAttention(nnx.Module):
         q = _apply_rope(q, self._freqs)
         k = _apply_rope(k, self._freqs)
 
-        # Scaled dot-product with causal mask
+        # Scaled dot-product with causal mask (mask pre-built in __init__)
         attn = jnp.einsum('bhsd,bhtd->bhst', q, k) * self.scale
-        mask = jnp.tril(jnp.ones((T, T), dtype=bool))
-        attn = jnp.where(mask, attn, -1e9)
+        attn = jnp.where(self._mask[:T, :T], attn, -1e9)
         attn = jax.nn.softmax(attn, axis=-1)
 
         out = jnp.einsum('bhst,bhtd->bhsd', attn, v)    # (B, H, T, D)

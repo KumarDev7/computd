@@ -75,15 +75,44 @@ class WeightAssembler(nnx.Module):
         self,
         h_A: jax.Array,     # (batch, [seq,] d_A)
         alpha: jax.Array,   # (batch, [seq,] k_max)
-        idx: jax.Array,     # (batch, [seq,] k_max)
+        idx: jax.Array,     # (batch, k_max) seq-level  OR  (batch, seq, k_max) per-position
         vectors: jax.Array, # (N, D)
     ) -> jax.Array:
         """Returns h_mid (batch, [seq,] d_B) after middle layer."""
-        W, b = self.assemble(alpha, idx, vectors)
-        gamma = self.gamma.value
-
-        # h_A: (..., d_A), W: (..., d_B, d_A) → (..., d_B)
-        transformed = jnp.einsum('...d,...id->...i', h_A, W) + b
-
+        gamma    = self.gamma.value
         residual = h_A if self.d_A == self.d_B else jnp.zeros((*h_A.shape[:-1], self.d_B))
-        return self.norm(residual + gamma * transformed)
+
+        if idx is None:
+            # ── Soft mode (TPU training): alpha is (batch, seq, N) over ALL N vectors.
+            # No gather — decompose the pool in-place, all ops are GEMMs.
+            N      = vectors.shape[0]
+            U_pool = vectors[:, :self._off_V].reshape(N, self.d_B, self.r)
+            V_pool = vectors[:, self._off_V:self._off_b].reshape(N, self.r, self.d_A)
+            b_pool = vectors[:, self._off_b:self._end_b]             # (N, d_B)
+
+            hV      = jnp.einsum('bsd,nrd->bsnr', h_A, V_pool)      # (b, s, N, r)
+            hV_a    = hV * alpha[:, :, :, None]                       # (b, s, N, r)
+            h_delta = jnp.einsum('bsnr,nir->bsi', hV_a, U_pool)      # (b, s, d_B)
+            b_delta = jnp.einsum('bsn,nj->bsj', alpha, b_pool)       # (b, s, d_B)
+            h_base  = jnp.einsum('bsd,id->bsi', h_A, self.W_base.value) + self.b_base.value
+        else:
+            # ── Hard mode: gather the k selected vectors first, then assemble.
+            selected = vectors[idx]   # (batch, k_max, D)  or  (batch, seq, k_max, D)
+            U      = selected[..., :self._off_V].reshape(*selected.shape[:-1], self.d_B, self.r)
+            V      = selected[..., self._off_V:self._off_b].reshape(*selected.shape[:-1], self.r, self.d_A)
+            b_vecs = selected[..., self._off_b:self._end_b]
+
+            if idx.ndim == 2:
+                # Sequence-level: U/V/b have no seq dim; alpha has it.
+                hV      = jnp.einsum('bsd,bkrd->bskr', h_A, V)
+                h_delta = jnp.einsum('bskr,bkir->bsi', hV * alpha[:, :, :, None], U)
+                b_delta = jnp.einsum('bsk,bkj->bsj', alpha, b_vecs)
+                h_base  = jnp.einsum('bsd,id->bsi', h_A, self.W_base.value) + self.b_base.value
+            else:
+                # Per-position: all tensors share (batch, seq) leading dims.
+                hV      = jnp.einsum('...d,...krd->...kr', h_A, V)
+                h_delta = jnp.einsum('...kr,...kir->...i', hV * alpha[..., None], U)
+                b_delta = jnp.einsum('...k,...kj->...j', alpha, b_vecs)
+                h_base  = jnp.einsum('...d,id->...i', h_A, self.W_base.value) + self.b_base.value
+
+        return self.norm(residual + gamma * (h_base + h_delta + b_delta))

@@ -71,3 +71,66 @@ class MultiAspectRetrieval(nnx.Module):
                 top_vals, idx = jax.lax.top_k(alpha_raw, k_max)
                 alpha = top_vals / (jnp.sum(top_vals, axis=-1, keepdims=True) + 1e-8)
             return alpha, idx, sims, alpha_raw
+
+    def soft_forward(
+        self,
+        z: jax.Array,        # (batch, seq, d_A)
+        vectors: jax.Array,  # (N, D)
+        T: float = 1.0,
+        lambda_sharp: float = 1.0,
+        use_sigmoid: bool = True,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """
+        Soft retrieval: alpha over ALL N vectors — no top-k, no gather, pure GEMMs.
+        TPU-optimal: every op is a dense matmul the MXU can saturate.
+
+        Returns:
+          alpha:         (batch, seq, N) — per-position soft weights over all N
+          sims_seq:      (batch, N)     — seq-mean sims  (for aux losses)
+          alpha_raw_seq: (batch, N)     — seq-mean raw scores
+        """
+        # Keys for all N vectors: (S, N, d_k)
+        keys = jnp.einsum('skd,nd->snk', self.W_K.value, vectors)
+        keys = keys / (jnp.linalg.norm(keys, axis=-1, keepdims=True) + 1e-8)
+
+        # Per-position queries: (S, batch, seq, d_k)
+        queries = jnp.einsum('skd,btd->sbtk', self.W_Q.value, z)
+        queries = queries / (jnp.linalg.norm(queries, axis=-1, keepdims=True) + 1e-8)
+
+        # Per-position similarities to all N: (S, batch, seq, N)
+        sims = jnp.einsum('sbtk,snk->sbtn', queries, keys)
+        w      = jax.nn.softmax(self.aspect_logits.value)
+        sims_w = jnp.einsum('s,sbtn->btn', w, sims)  # (batch, seq, N)
+
+        if use_sigmoid:
+            tau       = jnp.dot(w, self.tau.value)
+            gate      = jax.nn.sigmoid(lambda_sharp * (sims_w - tau))
+            alpha_raw = gate * jnp.exp(sims_w / T)
+        else:
+            alpha_raw = jnp.exp(sims_w / T)
+
+        alpha = alpha_raw / (alpha_raw.sum(axis=-1, keepdims=True) + 1e-8)
+
+        # Collapse seq dim for aux-loss compatibility (diversity_loss, entropy_loss)
+        return alpha, sims_w.mean(axis=1), alpha_raw.mean(axis=1)
+
+    def per_position_alpha(
+        self,
+        z: jax.Array,              # (batch, seq, d_A)
+        selected_vecs: jax.Array,  # (batch, k_max, D) — already-gathered k vectors
+    ) -> jax.Array:                # (batch, seq, k_max)
+        """
+        Per-position weights against the k pre-selected vectors.
+        Cost: O(batch × seq × k × d_k) — no N-wide similarity scan.
+        Called after sequence-level retrieval determines which k vectors to use.
+        """
+        # Keys for only the k selected vectors: (S, batch, k_max, d_k)
+        keys = jnp.einsum('sdc,bkc->sbkd', self.W_K.value, selected_vecs)
+        keys = keys / (jnp.linalg.norm(keys, axis=-1, keepdims=True) + 1e-8)
+        # Per-position queries: (S, batch, seq, d_k)
+        queries = jnp.einsum('sdc,btc->sbtd', self.W_Q.value, z)
+        queries = queries / (jnp.linalg.norm(queries, axis=-1, keepdims=True) + 1e-8)
+        # Similarities: (S, batch, seq, k_max) — no N dim!
+        sims = jnp.einsum('sbtd,sbkd->sbtk', queries, keys)
+        w    = jax.nn.softmax(self.aspect_logits.value)
+        return jax.nn.softmax(jnp.einsum('s,sbtk->btk', w, sims), axis=-1)

@@ -127,7 +127,8 @@ def loss_fn(
     use_sigmoid: bool,
     lambda_sharp: float,
     lambda_entropy_eff: float,
-    forced_idx: jax.Array,      # (batch, k_max) — used in phase1, ignored in phase2
+    forced_idx: jax.Array,
+    soft: bool,
 ):
     x       = batch[:, :-1]
     targets = batch[:, 1:]
@@ -135,14 +136,14 @@ def loss_fn(
     vocab_size = model.config.d_input
     x_onehot   = jax.nn.one_hot(x, vocab_size)
 
-    # Phase 1 uses forced_idx for vector rotation; phase 2 ignores it
-    fwd_forced = forced_idx if not use_sigmoid else None
+    fwd_forced = forced_idx if (not use_sigmoid and not soft) else None
     logits, aux = model(
         x_onehot,
         use_sigmoid=use_sigmoid,
         lambda_sharp=lambda_sharp,
         forced_idx=fwd_forced,
         return_aux=True,
+        soft=soft,
     )
 
     log_probs = jax.nn.log_softmax(logits, axis=-1)
@@ -150,11 +151,12 @@ def loss_fn(
         jnp.sum(jax.nn.one_hot(targets, vocab_size) * log_probs, axis=-1)
     )
 
-    if use_sigmoid:
+    # Compute aux losses in phase-2 (hard) OR always in soft mode
+    if use_sigmoid or soft:
         aux_losses = compute_aux_losses(
             model,
             aux["alpha"],
-            aux["idx"],
+            aux["idx"],          # None in soft mode — diversity_loss handles this
             aux["sims"],
             aux["alpha_raw"],
             lambda_entropy_eff=lambda_entropy_eff,
@@ -169,37 +171,51 @@ def loss_fn(
     return total_loss, (metrics, aux)
 
 
-# use_sigmoid is static → exactly 2 jit compilations over full training
-@nnx.jit(static_argnums=(3,))
+# use_sigmoid and soft are static → at most 4 jit compilations over full training
+@nnx.jit(static_argnums=(3, 4))
 def train_step(
     model: nnx.Module,
     optimizer: nnx.Optimizer,
     batch: jax.Array,
     use_sigmoid: bool,
+    soft: bool,
     lambda_sharp: float,
     lambda_entropy_eff: float,
-    forced_idx: jax.Array,      # always passed; used iff use_sigmoid=False
+    forced_idx: jax.Array,
 ):
     grad_fn = nnx.value_and_grad(
         loss_fn, argnums=nnx.DiffState(0, nnx.Param), has_aux=True
     )
     (total_loss, (metrics, aux)), grads = grad_fn(
-        model, batch, use_sigmoid, lambda_sharp, lambda_entropy_eff, forced_idx
+        model, batch, use_sigmoid, lambda_sharp, lambda_entropy_eff, forced_idx, soft
     )
     optimizer.update(model, grads)
 
-    # EMA update — aggregate across all blocks for comprehensive pool coverage
+    # EMA update — soft and hard modes have different alpha shapes.
     N         = model.pool.N
     alpha_all = aux.get("alpha_all", [aux["alpha"]])
     idx_all   = aux.get("idx_all",   [aux["idx"]])
     n_blocks  = len(alpha_all)
-    alpha_sum = jnp.zeros(N)
-    for al, ix in zip(alpha_all, idx_all):
-        alpha_sum = alpha_sum.at[ix.reshape(-1)].add(
-            al.reshape(-1) / (batch.shape[0] * n_blocks)
-        )
-    model.pool.update_ema(alpha_sum, model.config.beta_ema)
 
+    if idx_all[0] is None:
+        # Soft mode: alpha is (batch, seq, N) — direct mean, no scatter needed.
+        all_alpha = jnp.stack(alpha_all)          # (n_blocks, batch, seq, N)
+        alpha_sum = all_alpha.mean(axis=(0, 1, 2)) # (N,) — mean over blocks/batch/seq
+    else:
+        # Hard mode: scatter alpha into N-dim using idx.
+        all_idx   = jnp.stack(idx_all)    # (n_blocks, batch, [seq,] k_max)
+        all_alpha = jnp.stack(alpha_all)   # (n_blocks, batch, [seq,] k_max)
+        if all_idx.ndim == 3:
+            # Sequence-level idx: sum alpha over seq before scattering
+            all_alpha = all_alpha.sum(axis=2)
+            denom = batch.shape[0] * n_blocks * alpha_all[0].shape[1]
+        else:
+            denom = batch.shape[0] * n_blocks
+        alpha_sum = jnp.zeros(N).at[all_idx.reshape(-1)].add(
+            all_alpha.reshape(-1) / denom
+        )
+
+    model.pool.update_ema(alpha_sum, model.config.beta_ema)
     metrics["loss"] = total_loss
     return metrics
 
@@ -215,11 +231,10 @@ def train_loop(
     seed: int = 0,
 ):
     cfg      = model.config
+    soft     = getattr(cfg, 'soft_train', False)
     rng      = np.random.default_rng(seed)
-    rotator  = Phase1Rotator(cfg.N, cfg.k_max * 4, cfg.k_max, seed=seed)
-    # Note: rotator uses batch=k_max*4 as a stand-in; actual batch inferred below
     resets   = 0
-    _rotator = None  # lazily init with real batch size
+    _rotator = None  # lazily init with real batch size on first step
 
     for step, batch in zip(range(total_steps), data_iter):
         t0 = time.time()
@@ -229,25 +244,25 @@ def train_loop(
 
         use_sigmoid, lambda_sharp, lambda_entropy_eff = get_phase_params(step, cfg)
 
-        # Lazily create rotator with real batch size on first step
-        if _rotator is None:
-            real_batch = batch.shape[0]
-            _rotator = Phase1Rotator(cfg.N, real_batch, cfg.k_max, seed=seed)
-
-        if not use_sigmoid:
-            forced_idx = _rotator.next()
+        # Rotator only needed in hard mode (soft mode doesn't use forced_idx)
+        if not soft:
+            if _rotator is None:
+                _rotator = Phase1Rotator(cfg.N, batch.shape[0], cfg.k_max, seed=seed)
+            forced_idx = _rotator.next() if not use_sigmoid else _rotator.dummy()
         else:
-            forced_idx = _rotator.dummy()
+            if _rotator is None:
+                _rotator = Phase1Rotator(cfg.N, batch.shape[0], cfg.k_max, seed=seed)
+            forced_idx = _rotator.dummy()  # ignored by soft_forward
 
         metrics = train_step(
             model, optimizer, batch,
-            use_sigmoid, lambda_sharp, lambda_entropy_eff, forced_idx
+            use_sigmoid, soft, lambda_sharp, lambda_entropy_eff, forced_idx
         )
-        metrics = jax.device_get(metrics)
-
+        # device_get only at log points — keeps GPU async between steps
         if step % log_every == 0:
-            msg = [f"step={step:05d}"]
-            for k, v in sorted(metrics.items()):
+            m = jax.device_get(metrics)
+            msg = [f"step={step:05d}  soft={soft}"]
+            for k, v in sorted(m.items()):
                 msg.append(f"{k}={float(v):.4f}")
             msg.append(f"lent={lambda_entropy_eff:.4f}  resets={resets}")
             msg.append(f"t={int((time.time()-t0)*1000)}ms")
