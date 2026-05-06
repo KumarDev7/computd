@@ -8,16 +8,16 @@ from flax import nnx
 from .losses import compute_aux_losses
 
 
-# ─── Phase helpers ────────────────────────────────────────────────────────────
+# --- Phase helpers ---------------------------------------------------------------
 
 def get_phase_params(step: int, config) -> tuple[bool, float, float]:
     """
-    Returns (use_sigmoid, lambda_sharp, lambda_entropy_eff) — all Python scalars.
+    Returns (use_sigmoid, lambda_sharp, lambda_entropy_eff) -- all Python scalars.
 
     lambda_entropy is annealed:
       Phase 1: 0.0          (warmup rotation, no entropy pressure)
-      Phase 2: max → 0.3×   (strong early to prevent premature collapse, then relax)
-      Phase 3: 0.1×          (just enough to prevent extinction)
+      Phase 2: max -> 0.3x   (strong early to prevent premature collapse, then relax)
+      Phase 3: 0.1x          (just enough to prevent extinction)
     """
     base_ent = config.lambda_entropy
     if step < config.phase1_end:
@@ -32,7 +32,7 @@ def get_phase_params(step: int, config) -> tuple[bool, float, float]:
         return True, 5.0 + 5.0 * t, base_ent * 0.1
 
 
-# ─── Phase-1 vector rotation schedule ────────────────────────────────────────
+# --- Phase-1 vector rotation schedule -------------------------------------------
 
 class Phase1Rotator:
     """
@@ -41,8 +41,8 @@ class Phase1Rotator:
     before phase 2 begins.
 
     Strategy: build a large cyclic permutation of all N indices, then slide a
-    window of size (batch × k_max) forward by that amount each step.
-    With N=512, batch=32, k_max=8 → 256 vectors covered per step,
+    window of size (batch x k_max) forward by that amount each step.
+    With N=512, batch=32, k_max=8 -> 256 vectors covered per step,
     all 512 visited every ~2 steps.
     """
 
@@ -51,7 +51,6 @@ class Phase1Rotator:
         self.batch = batch
         self.k_max = k_max
         self._rng  = np.random.default_rng(seed)
-        # Large tiled permutation so we never run out of indices
         base_perm  = self._rng.permutation(N).astype(np.int32)
         repeats    = (batch * k_max * 20_000) // N + 2
         self._perm = np.tile(base_perm, repeats)
@@ -69,7 +68,7 @@ class Phase1Rotator:
         return jnp.zeros((self.batch, self.k_max), dtype=jnp.int32)
 
 
-# ─── Codebook reset ───────────────────────────────────────────────────────────
+# --- Codebook reset --------------------------------------------------------------
 
 def reset_dead_vectors(model, rng: np.random.Generator) -> int:
     cfg      = model.config
@@ -89,7 +88,7 @@ def reset_dead_vectors(model, rng: np.random.Generator) -> int:
     return len(dead_idx)
 
 
-# ─── Optimizer ────────────────────────────────────────────────────────────────
+# --- Optimizer -------------------------------------------------------------------
 
 def make_optimizer(model: nnx.Module, config) -> nnx.Optimizer:
     def _leaf_label(path, _leaf):
@@ -119,7 +118,7 @@ def make_optimizer(model: nnx.Module, config) -> nnx.Optimizer:
     return nnx.Optimizer(model, tx, wrt=nnx.Param)
 
 
-# ─── Loss & train step ────────────────────────────────────────────────────────
+# --- Loss & train step -----------------------------------------------------------
 
 def loss_fn(
     model: nnx.Module,
@@ -156,7 +155,7 @@ def loss_fn(
         aux_losses = compute_aux_losses(
             model,
             aux["alpha"],
-            aux["idx"],          # None in soft mode — diversity_loss handles this
+            aux["idx"],          # None in soft mode -- diversity_loss handles this
             aux["sims"],
             aux["alpha_raw"],
             lambda_entropy_eff=lambda_entropy_eff,
@@ -171,7 +170,7 @@ def loss_fn(
     return total_loss, (metrics, aux)
 
 
-# use_sigmoid and soft are static → at most 4 jit compilations over full training
+# use_sigmoid and soft are static -> at most 4 jit compilations over full training
 @nnx.jit(static_argnums=(3, 4))
 def train_step(
     model: nnx.Module,
@@ -191,16 +190,16 @@ def train_step(
     )
     optimizer.update(model, grads)
 
-    # EMA update — soft and hard modes have different alpha shapes.
+    # EMA update -- soft and hard modes have different alpha shapes.
     N         = model.pool.N
     alpha_all = aux.get("alpha_all", [aux["alpha"]])
     idx_all   = aux.get("idx_all",   [aux["idx"]])
     n_blocks  = len(alpha_all)
 
     if idx_all[0] is None:
-        # Soft mode: alpha is (batch, seq, N) — direct mean, no scatter needed.
+        # Soft mode: alpha is (batch, seq, N) -- direct mean, no scatter needed.
         all_alpha = jnp.stack(alpha_all)          # (n_blocks, batch, seq, N)
-        alpha_sum = all_alpha.mean(axis=(0, 1, 2)) # (N,) — mean over blocks/batch/seq
+        alpha_sum = all_alpha.mean(axis=(0, 1, 2)) # (N,) -- mean over blocks/batch/seq
     else:
         # Hard mode: scatter alpha into N-dim using idx.
         all_idx   = jnp.stack(idx_all)    # (n_blocks, batch, [seq,] k_max)
@@ -220,36 +219,7 @@ def train_step(
     return metrics
 
 
-# ─── Text generation ────────────────────────────────────────────────────────────
-
-@nnx.jit(static_argnums=(4, 5, 6))
-def _generate_step(
-    model,
-    context: jax.Array,        # (1, max_seq_len) int32
-    pos: jax.Array,            # scalar int — 1-indexed position to read logit from
-    rng_key: jax.Array,        # PRNG key
-    temperature: float,        # static
-    soft: bool,                # static
-    top_k: int,                # static — 0 = disabled
-) -> tuple[jax.Array, jax.Array]:
-    """Single JIT-compiled generation step. Returns (next_token, new_rng_key)."""
-    cfg = model.config
-    x_onehot = jax.nn.one_hot(context, cfg.d_input)
-    # valid_len=pos: only positions 0..pos-1 are real tokens (rest are padding)
-    logits = model(x_onehot, use_sigmoid=True, lambda_sharp=5.0, soft=soft, valid_len=pos)
-
-    # Logit at position (pos-1) predicts token at position pos
-    next_logits = logits[:, pos - 1, :] / temperature
-
-    if top_k > 0:
-        top_vals = jnp.sort(next_logits, axis=-1)[:, -top_k:]
-        threshold = top_vals[:, 0:1]
-        next_logits = jnp.where(next_logits >= threshold, next_logits, -1e10)
-
-    rng_key, subkey = jax.random.split(rng_key)
-    next_token = jax.random.categorical(subkey, next_logits, axis=-1)
-    return next_token, rng_key
-
+# --- Text generation via lax.scan (JIT-compiled, no Python loop) -----------------
 
 def generate(
     model,
@@ -261,48 +231,79 @@ def generate(
     seed: int = 42,
 ) -> jax.Array:
     """
-    Autoregressive generation. Returns (1, prompt_len + max_new_tokens) int32.
+    Autoregressive generation via lax.scan -- entire loop compiles to one
+    XLA program, eliminating Python overhead and recompilation per token.
 
-    JIT-compiled per-step with a fixed-size context window — no shape changes
-    between steps so the model compiles exactly once, then runs ~200× faster.
+    Uses a fixed-size buffer padded with out-of-vocab indices so the model
+    always sees (1, max_seq_len, d_input). Out-of-range index -> one_hot
+    produces all-zeros, so padded positions carry no information.
+
+    Returns (1, prompt_len + max_new_tokens) int32.
     """
     cfg = model.config
+    max_seq_len = cfg.max_seq_len
+    d_input = cfg.d_input
     prompt_len = prompt_tokens.shape[1]
-    total_len = prompt_len + max_new_tokens
 
-    token_buffer = jnp.zeros((1, total_len), dtype=jnp.int32)
-    token_buffer = token_buffer.at[:, :prompt_len].set(prompt_tokens)
+    # Cap generation so prompt + new tokens fits in context window
+    max_new_tokens = min(max_new_tokens, max_seq_len - prompt_len)
 
-    rng_key = jax.random.PRNGKey(seed)
+    # Buffer: (1, max_seq_len) -- prompt at start, rest padded with d_input
+    # one_hot(d_input, d_input) = all zeros (out-of-range index)
+    pad_id = d_input
+    buffer = jnp.full((1, max_seq_len), pad_id, dtype=jnp.int32)
+    buffer = buffer.at[:, :prompt_len].set(prompt_tokens)
+
     top_k_val = top_k if top_k is not None else 0
+    use_top_k = top_k is not None
 
-    for i in range(max_new_tokens):
-        pos = prompt_len + i  # absolute position of token to predict
+    @nnx.jit
+    def _scan_generate(buffer, init_pos, rng):
+        """Fixed-shape scan: buffer always (1, max_seq_len), one compilation."""
+        def body(carry, _):
+            buffer, pos, rng = carry
+            rng, subkey = jax.random.split(rng)
 
-        # Sliding context window of max_seq_len tokens ending at pos
-        start = max(0, pos + 1 - cfg.max_seq_len)
-        context = token_buffer[:, start:start + cfg.max_seq_len]
-        # Pad to exactly max_seq_len if buffer shorter (early steps)
-        pad_size = cfg.max_seq_len - context.shape[1]
-        if pad_size > 0:
-            context = jnp.concatenate(
-                [context, jnp.zeros((1, pad_size), dtype=jnp.int32)], axis=1
+            # Full forward pass on fixed-shape buffer -- compiles once
+            x_onehot = jax.nn.one_hot(buffer, d_input)  # (1, max_seq_len, d_input)
+            logits = model(x_onehot, use_sigmoid=True, lambda_sharp=5.0, soft=soft)
+
+            # Sample at position pos (last real token predicts pos+1)
+            next_logits = jax.lax.dynamic_slice(
+                logits, (0, pos, 0), (1, 1, d_input)
+            ).squeeze((0, 1)) / temperature
+
+            # Top-k filtering
+            if use_top_k:
+                sorted_logits = jnp.sort(next_logits)
+                threshold = sorted_logits[-top_k_val]
+                next_logits = jnp.where(
+                    next_logits >= threshold, next_logits, -1e10
+                )
+
+            next_token = jax.random.categorical(subkey, next_logits)
+
+            # Write generated token at position pos+1
+            buffer = jax.lax.dynamic_update_slice(
+                buffer, next_token[None, None], (0, pos + 1)
             )
+            pos = pos + 1
 
-        # 1-indexed: logit at (pos_in_window - 1) predicts pos_in_window
-        pos_in_window = pos - start + 1
+            return (buffer, pos, rng), None
 
-        next_token, rng_key = _generate_step(
-            model, context,
-            jnp.array(pos_in_window),
-            rng_key, temperature, soft, top_k_val,
+        (buffer, _, _), _ = jax.lax.scan(
+            body, (buffer, init_pos, rng), None, length=max_new_tokens
         )
-        token_buffer = token_buffer.at[:, pos].set(next_token)
+        return buffer
 
-    return token_buffer[:, :total_len]
+    rng = jax.random.PRNGKey(seed)
+    result = _scan_generate(
+        buffer, jnp.array(prompt_len - 1, dtype=jnp.int32), rng
+    )
+    return result[:, :prompt_len + max_new_tokens]
 
 
-# ─── Training loop ────────────────────────────────────────────────────────────
+# --- Training loop ---------------------------------------------------------------
 
 def train_loop(
     model,
@@ -329,7 +330,7 @@ def train_loop(
             batch = batch[0]
         t0 = time.time()
 
-        # Codebook resets only in hard mode — soft mode gives every vector
+        # Codebook resets only in hard mode -- soft mode gives every vector
         # gradients each step, so low EMA just means natural sparsity, not death.
         if not soft and cfg.reset_interval > 0 and step > 0 and step % cfg.reset_interval == 0:
             resets += reset_dead_vectors(model, rng)
@@ -350,7 +351,7 @@ def train_loop(
             model, optimizer, batch,
             use_sigmoid, soft, lambda_sharp, lambda_entropy_eff, forced_idx
         )
-        # device_get only at log points — keeps GPU async between steps
+        # device_get only at log points -- keeps GPU async between steps
         if step % log_every == 0:
             m = jax.device_get(metrics)
             msg = [f"step={step:05d}  soft={soft}"]

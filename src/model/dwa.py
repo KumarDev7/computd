@@ -9,7 +9,7 @@ from .assembly import WeightAssembler
 
 
 def _retrieve_per_position(z, retrieval_module, pool_vectors, k_max, T, lambda_sharp,
-                            use_sigmoid, forced_idx, valid_len=None):
+                            use_sigmoid, forced_idx):
     """
     Sequence-level retrieval (3D input) or direct retrieval (2D input).
 
@@ -20,18 +20,13 @@ def _retrieve_per_position(z, retrieval_module, pool_vectors, k_max, T, lambda_s
       • alpha: (batch, seq, k_max) — per-position weights computed cheaply against
         only the k selected vectors (no N-wide scan per position).
 
-    valid_len: when provided, only positions 0..valid_len-1 contribute to the
-    retrieval query. Used in generation to exclude zero-padded context positions.
+    2D path — direct retrieval, unchanged.
     """
     if z.ndim == 3:
         batch, seq, _ = z.shape
 
-        # Sequence-level query: mean over valid positions only
-        if valid_len is not None:
-            mask = jnp.arange(seq) < valid_len  # (seq,) bool
-            z_seq = (z * mask[None, :, None]).sum(axis=1) / valid_len.astype(jnp.float32)
-        else:
-            z_seq = z.mean(axis=1)  # (batch, d_A)
+        # Sequence-level query: mean over positions → one retrieval per sequence
+        z_seq = z.mean(axis=1)  # (batch, d_A)
 
         alpha_seq, idx, sims, alpha_raw = retrieval_module(
             z=z_seq,
@@ -82,7 +77,7 @@ class DWABlock(nnx.Module):
         self.assembler  = WeightAssembler(d_model, d_model, r, rngs=rngs)
 
     def __call__(self, h, pool_vectors, k_max, T, lambda_sharp, use_sigmoid,
-                 forced_idx=None, soft=False, valid_len=None):
+                 forced_idx=None, soft=False):
         if self.n_heads > 0:
             h = self.attn(h)
         z = self.query_proj(h)
@@ -95,8 +90,7 @@ class DWABlock(nnx.Module):
             idx = None  # no discrete selection in soft mode
         else:
             alpha, idx, sims, alpha_raw = _retrieve_per_position(
-                z, self.retrieval, pool_vectors, k_max, T, lambda_sharp, use_sigmoid, forced_idx,
-                valid_len=valid_len,
+                z, self.retrieval, pool_vectors, k_max, T, lambda_sharp, use_sigmoid, forced_idx
             )
 
         h_out = self.assembler(h, alpha, idx, pool_vectors)
@@ -136,7 +130,6 @@ class DWAModel(nnx.Module):
         return_aux: bool = False,
         forced_idx: jax.Array | None = None,  # (batch, k_max) for phase-1 warmup
         soft: bool = False,                    # True → soft dense pool (TPU training)
-        valid_len: jax.Array | None = None,   # number of valid (non-padded) positions
     ):
         cfg       = self.config
         pool_vecs = self.pool.vectors.value
@@ -147,7 +140,7 @@ class DWAModel(nnx.Module):
         for block in self.blocks:
             h, alpha, idx, sims, alpha_raw = block(
                 h, pool_vecs, cfg.k_max, cfg.T, lambda_sharp, use_sigmoid, forced_idx,
-                soft=soft, valid_len=valid_len,
+                soft=soft,
             )
             alpha_list.append(alpha)
             idx_list.append(idx)
