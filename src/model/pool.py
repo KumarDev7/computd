@@ -16,9 +16,28 @@ class VectorPool(nnx.Module):
     Gradient flows both from retrieval (key projection) and assembly (U,V,b).
     """
 
-    def __init__(self, N: int, D: int, rngs: nnx.Rngs):
+    def __init__(self, N: int, D: int, rngs: nnx.Rngs, sharding=None):
         key = rngs.params()
-        self.vectors = nnx.Param(jax.random.normal(key, (N, D)) * 0.02)
+        if sharding is not None:
+            # Create directly sharded — avoids materialising the full (N, D) on host.
+            # jax.make_array_from_callback gives each device a shard_index map.
+            n_devices = sharding.mesh.size
+            per_device_n = N // n_devices
+            def _data_callback(shard_indices):
+                # shard_indices is a tuple of slice objects per dimension
+                # For P('tp', None): dim0 is sharded, dim1 is full
+                # Figure out which device index this is from the dim0 slice start
+                sl0 = shard_indices[0]
+                device_idx = sl0.start // per_device_n
+                shard_key = jax.random.fold_in(key, device_idx)
+                local_shape = (sl0.stop - sl0.start, D)
+                return jax.random.normal(shard_key, local_shape, dtype=jnp.float32) * 0.02
+            vectors = jax.make_array_from_callback(
+                (N, D), sharding, _data_callback
+            )
+        else:
+            vectors = jax.random.normal(key, (N, D)) * 0.02
+        self.vectors = nnx.Param(vectors)
         # EMA of mean α per vector across batches — used in utilization loss
         self.ema_usage = EMAState(jnp.zeros(N))
 

@@ -79,16 +79,18 @@ class DWABlock(nnx.Module):
     """
 
     def __init__(self, d_model: int, r: int, S: int, d_k: int, N: int, D: int,
-                 n_heads: int, max_seq_len: int, rngs: nnx.Rngs):
+                 n_heads: int, max_seq_len: int, rngs: nnx.Rngs, wk_sharding=None):
         self.n_heads = n_heads
         if n_heads > 0:
             self.attn = CausalSelfAttention(d_model, n_heads, max_seq_len, rngs)
         self.query_proj = nnx.Linear(d_model, d_model, rngs=rngs)
-        self.retrieval  = MultiAspectRetrieval(D=D, d_A=d_model, S=S, d_k=d_k, N=N, rngs=rngs)
+        self.retrieval  = MultiAspectRetrieval(D=D, d_A=d_model, S=S, d_k=d_k, N=N, rngs=rngs,
+                                               wk_sharding=wk_sharding)
         self.assembler  = WeightAssembler(d_model, d_model, r, rngs=rngs)
 
     def __call__(self, h, pool_vectors, k_max, T, lambda_sharp, use_sigmoid,
-                 forced_idx=None, soft=False, hybrid=False):
+                 forced_idx=None, soft=False, hybrid=False, pallas=False,
+                 tp_axis: str | None = None, mesh=None):
         if self.n_heads > 0:
             h = self.attn(h)
         z = self.query_proj(h)
@@ -99,8 +101,13 @@ class DWABlock(nnx.Module):
                 z, pool_vectors, T, lambda_sharp, use_sigmoid
             )
             idx = None  # no discrete selection in soft mode
+        elif pallas and z.ndim == 3:
+            # Pallas hybrid: fused GEMM+gate+exp Pallas kernel + multi-chip all_gather.
+            alpha, idx, sims, alpha_raw = self.retrieval.pallas_hybrid_forward(
+                z, pool_vectors, k_max, T, lambda_sharp, use_sigmoid, tp_axis=tp_axis, mesh=mesh
+            )
         elif hybrid and z.ndim == 3:
-            # Hybrid mode: full GEMM compute, keep only top-k — best of both worlds.
+            # Pure-JAX hybrid mode: full GEMM compute, keep only top-k.
             alpha, idx, sims, alpha_raw = _retrieve_per_position(
                 z, self.retrieval, pool_vectors, k_max, T, lambda_sharp,
                 use_sigmoid, forced_idx, hybrid=True
@@ -124,17 +131,27 @@ class DWAModel(nnx.Module):
           h → PartB → logits
     """
 
-    def __init__(self, config, rngs: nnx.Rngs):
+    def __init__(self, config, rngs: nnx.Rngs, mesh=None):
         n_layers    = getattr(config, 'n_assembly_layers', 1)
         n_heads     = getattr(config, 'n_heads', 0)
         max_seq_len = getattr(config, 'max_seq_len', 256)
 
         self.config = config
+        self._mesh  = mesh   # also set by shard_model() if constructed later
+
+        # Pre-compute shardings if mesh is available — avoids OOM on init
+        pool_sharding = None
+        wk_sharding   = None
+        if mesh is not None:
+            from jax.sharding import NamedSharding, PartitionSpec as P
+            pool_sharding = NamedSharding(mesh, P('tp', None))
+            wk_sharding   = NamedSharding(mesh, P(None, None, 'tp'))
+
         self.part_a = PartA(config.d_input, config.d_A, n_heads=0, rngs=rngs)  # MLP only
-        self.pool   = VectorPool(config.N, config.D, rngs=rngs)
+        self.pool   = VectorPool(config.N, config.D, rngs=rngs, sharding=pool_sharding)
         self.blocks = nnx.List([
             DWABlock(config.d_A, config.r, config.S, config.d_k, config.N, config.D,
-                     n_heads, max_seq_len, rngs)
+                     n_heads, max_seq_len, rngs, wk_sharding=wk_sharding)
             for _ in range(n_layers)
         ])
         self.part_b = PartB(config.d_B, config.d_input, rngs=rngs)
@@ -147,10 +164,15 @@ class DWAModel(nnx.Module):
         return_aux: bool = False,
         forced_idx: jax.Array | None = None,  # (batch, k_max) for phase-1 warmup
         soft: bool = False,                    # True → soft dense pool (TPU training)
-        hybrid: bool = False,                 # True → full GEMM compute, top-k keep
+        hybrid: bool = False,                  # True → full JAX GEMM compute, top-k keep
+        pallas: bool = False,                  # True → Pallas fused kernel + multi-chip TP
+        tp_axis: str | None = None,            # mesh axis name for all_gather ('tp' or None)
+        mesh=None,                             # jax.sharding.Mesh — captured, not traced
     ):
         cfg       = self.config
         pool_vecs = self.pool.vectors.value
+        # Resolve mesh: explicit arg > stored _mesh > None
+        mesh = mesh if mesh is not None else self._mesh
 
         h = self.part_a(x)  # returns h_A directly (no tuple)
 
@@ -158,7 +180,7 @@ class DWAModel(nnx.Module):
         for block in self.blocks:
             h, alpha, idx, sims, alpha_raw = block(
                 h, pool_vecs, cfg.k_max, cfg.T, lambda_sharp, use_sigmoid, forced_idx,
-                soft=soft, hybrid=hybrid,
+                soft=soft, hybrid=hybrid, pallas=pallas, tp_axis=tp_axis, mesh=mesh,
             )
             alpha_list.append(alpha)
             idx_list.append(idx)

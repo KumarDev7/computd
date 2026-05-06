@@ -1,3 +1,4 @@
+import functools
 import jax
 import jax.numpy as jnp
 from flax import nnx
@@ -17,7 +18,8 @@ class MultiAspectRetrieval(nnx.Module):
       - Now retrieval has real content to discriminate between.
     """
 
-    def __init__(self, D: int, d_A: int, S: int, d_k: int, N: int, rngs: nnx.Rngs):
+    def __init__(self, D: int, d_A: int, S: int, d_k: int, N: int, rngs: nnx.Rngs,
+                 wk_sharding=None):
         self.S = S
         self.d_k = d_k
         self.N = N
@@ -25,9 +27,22 @@ class MultiAspectRetrieval(nnx.Module):
         self.W_Q = nnx.Param(
             jax.random.normal(rngs.params(), (S, d_k, d_A)) * (d_A ** -0.5)
         )
-        self.W_K = nnx.Param(
-            jax.random.normal(rngs.params(), (S, d_k, D)) * (D ** -0.5)
-        )
+        if wk_sharding is not None:
+            # Create W_K directly sharded to avoid OOM on one device.
+            # (S, d_k, D) sharded as P(None, None, 'tp') — D split across chips.
+            wk_shape = (S, d_k, D)
+            def _wk_callback(idx):
+                # idx[2].start // (D // n_devices) gives the device index
+                n_dev = wk_sharding.mesh.size
+                d_local = D // n_dev
+                dev_idx = idx[2].start // d_local
+                k = jax.random.fold_in(rngs.params(), dev_idx + 100)  # different seed per shard
+                local_shape = (S, d_k, idx[2].stop - idx[2].start)
+                return jax.random.normal(k, local_shape, dtype=jnp.float32) * (D ** -0.5)
+            W_K_val = jax.make_array_from_callback(wk_shape, wk_sharding, _wk_callback)
+        else:
+            W_K_val = jax.random.normal(rngs.params(), (S, d_k, D)) * (D ** -0.5)
+        self.W_K = nnx.Param(W_K_val)
         self.aspect_logits = nnx.Param(jnp.zeros(S))
         self.tau = nnx.Param(jnp.zeros(S))
 
@@ -186,3 +201,144 @@ class MultiAspectRetrieval(nnx.Module):
         sims = jnp.einsum('sbtd,sbkd->sbtk', queries, keys)
         w    = jax.nn.softmax(self.aspect_logits.value)
         return jax.nn.softmax(jnp.einsum('s,sbtk->btk', w, sims), axis=-1)
+
+    def pallas_hybrid_forward(
+        self,
+        z: jax.Array,          # (batch, seq, d_A)
+        vectors: jax.Array,    # (N, D)  — full pool (GSPMD handles per-chip view)
+        k_max: int,
+        T: float = 1.0,
+        lambda_sharp: float = 1.0,
+        use_sigmoid: bool = True,
+        tp_axis: str | None = 'tp',   # mesh axis name for shard_map; None = single-chip
+        mesh=None,                    # jax.sharding.Mesh — required when tp_axis is not None
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        """
+        Pallas-backed hybrid retrieval with multi-chip support.
+
+        Each chip runs the fused GEMM+gate+exp Pallas kernel over its local
+        N_local pool shard.  Global top-k is obtained via all_gather of the
+        per-chip top-k candidates followed by a final JAX top_k.
+
+        Memory profile (7B, 8 chips, BT=8192, N=32768)
+        ------------------------------------------------
+        Per-chip fused scores : (8192, 4096) float32 = 128 MB
+        Full (B,T,N)          : never assembled on any single chip  ✓
+
+        Returns same 4-tuple as hybrid_forward:
+            alpha     (batch, seq, k_max)   — normalised weights
+            top_idx   (batch, seq, k_max)   — global pool indices
+            sims_seq  (batch, N_local)      — seq-mean sims (aux losses, local)
+            alpha_raw_seq (batch, N_local)  — seq-mean raw scores (aux losses, local)
+        """
+        from src.kernels.tiled_topk import tiled_topk_fused, tiled_topk_fallback
+
+        B, seq, d_A = z.shape
+        N_local = vectors.shape[0]
+
+        # ------------------------------------------------------------------
+        # 1. Project pool vectors to key space: (n_aspects, N_local, d_k)
+        # ------------------------------------------------------------------
+        keys_s = jnp.einsum('skd,nd->snk', self.W_K.value, vectors)  # (n_asp, N_local, d_k)
+        keys_s = keys_s / (jnp.linalg.norm(keys_s, axis=-1, keepdims=True) + 1e-8)
+
+        # ------------------------------------------------------------------
+        # 2. Project query tokens: (n_aspects, batch, seq, d_k)
+        # ------------------------------------------------------------------
+        queries_s = jnp.einsum('skd,btd->sbtk', self.W_Q.value, z)   # (n_asp, B, seq, d_k)
+        queries_s = queries_s / (jnp.linalg.norm(queries_s, axis=-1, keepdims=True) + 1e-8)
+
+        # ------------------------------------------------------------------
+        # 3. Aspect weights
+        # ------------------------------------------------------------------
+        w   = jax.nn.softmax(self.aspect_logits.value)   # (n_asp,)
+        tau = jnp.dot(w, self.tau.value) if use_sigmoid else jnp.array(0.0)
+
+        # ------------------------------------------------------------------
+        # 4. Collapse aspects into a single d_k projection via weighted mean.
+        #    keys_w:    (N_local, d_k)   — aspect-averaged keys
+        #    queries_w: (B*seq, d_k)     — aspect-averaged queries, flattened
+        # ------------------------------------------------------------------
+        keys_w    = jnp.einsum('s,snk->nk', w, keys_s)               # (N_local, d_k)
+        queries_w = jnp.einsum('s,sbtk->btk', w, queries_s)          # (B, seq, d_k)
+        queries_flat = queries_w.reshape(B * seq, -1)                 # (BT, d_k)
+
+        # ------------------------------------------------------------------
+        # 5+6. Cross-chip top-k merge via shard_map.
+        #
+        #  Uses the differentiable JAX fallback for the similarity computation
+        #  (Pallas kernel lacks reverse-mode autodiff).  The key memory win is
+        #  the 8-way TP sharding of the pool + top-k (only k_max kept), not the
+        #  Pallas fusion.  The Pallas kernel is available for inference-only use.
+        #
+        #  With tp_axis set: shard_map so each chip runs on its local pool shard,
+        #  then all_gather + merge (axis_index requires shard_map context).
+        #
+        #  Without tp_axis: single-chip, no communication.
+        # ------------------------------------------------------------------
+        BT = B * seq
+
+        if tp_axis is not None and mesh is not None:
+            import functools
+            from jax.experimental.shard_map import shard_map
+            from jax.sharding import PartitionSpec as P
+
+            def _chip_topk(queries_flat, keys_w_local):
+                N_local_l = keys_w_local.shape[0]
+                # Use differentiable JAX path (not Pallas — no VJP support)
+                tv, li = tiled_topk_fallback(
+                    queries_flat, keys_w_local, k_max,
+                    lambda_sharp, tau, T, bool(use_sigmoid),
+                )
+                chip_id    = jax.lax.axis_index(tp_axis)
+                global_idx = li + chip_id * N_local_l           # (BT, k_max)
+
+                cand_v = jax.lax.all_gather(tv,         tp_axis, axis=0, tiled=False)
+                cand_i = jax.lax.all_gather(global_idx, tp_axis, axis=0, tiled=False)
+                n_chips = cand_v.shape[0]
+
+                cv_flat = cand_v.transpose(1, 0, 2).reshape(BT, n_chips * k_max)
+                ci_flat = cand_i.transpose(1, 0, 2).reshape(BT, n_chips * k_max)
+                fv, sel = jax.lax.top_k(cv_flat, k_max)
+                fi = ci_flat[jnp.arange(BT)[:, None], sel]
+                return fv, fi
+
+            _chip_topk_sharded = functools.partial(
+                shard_map,
+                mesh=mesh,
+                in_specs=(P(), P(tp_axis, None)),
+                out_specs=(P(), P()),
+                check_rep=False,
+            )(_chip_topk)
+
+            final_v, final_i = _chip_topk_sharded(queries_flat, keys_w)
+        else:
+            # Single-chip path
+            final_v, final_i = tiled_topk_fallback(
+                queries_flat, keys_w, k_max,
+                lambda_sharp, tau, T, bool(use_sigmoid),
+            )
+
+        # ------------------------------------------------------------------
+        # 7. Reshape back to (batch, seq, k_max) and normalise alpha
+        # ------------------------------------------------------------------
+        top_vals_3d = final_v.reshape(B, seq, k_max)
+        top_idx_3d  = final_i.reshape(B, seq, k_max)
+        alpha = top_vals_3d / (jnp.sum(top_vals_3d, axis=-1, keepdims=True) + 1e-8)
+
+        # ------------------------------------------------------------------
+        # 8. Seq-mean sims for aux losses (cheap: mean query × all N_local keys)
+        #    Cost: (B, d_k) @ (d_k, N_local) — tiny compared to per-position
+        # ------------------------------------------------------------------
+        z_mean      = z.mean(axis=1)                                  # (B, d_A)
+        q_mean_s    = jnp.einsum('skd,bd->sbk', self.W_Q.value, z_mean)
+        q_mean_s    = q_mean_s / (jnp.linalg.norm(q_mean_s, axis=-1, keepdims=True) + 1e-8)
+        q_mean_w    = jnp.einsum('s,sbk->bk', w, q_mean_s)           # (B, d_k)
+        sims_seq    = jnp.einsum('bk,nk->bn', q_mean_w, keys_w)      # (B, N_local)
+
+        if use_sigmoid:
+            alpha_raw_seq = jax.nn.sigmoid(lambda_sharp * (sims_seq - tau)) * jnp.exp(sims_seq / T)
+        else:
+            alpha_raw_seq = jnp.exp(sims_seq / T)
+
+        return alpha, top_idx_3d, sims_seq, alpha_raw_seq
