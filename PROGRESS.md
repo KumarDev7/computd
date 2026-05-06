@@ -121,7 +121,10 @@ cfg.soft_train = False   # hard mode
 model = DWAModel(cfg, nnx.Rngs(0))
 opt = make_optimizer(model, cfg)
 
-_, _, tokenizer = shakespeare_loader('data/shakespeare.txt', 32, cfg.max_seq_len, split='val')
+tokenizer = None
+for _, tok in shakespeare_loader('data/shakespeare.txt', 32, cfg.max_seq_len, split='val'):
+    tokenizer = tok
+    break
 
 def gen(split):
     for batch, _ in shakespeare_loader('data/shakespeare.txt', 32, cfg.max_seq_len, split=split):
@@ -155,7 +158,10 @@ cfg.soft_train = True    # soft mode — all GEMMs, no gather
 model = DWAModel(cfg, nnx.Rngs(0))
 opt = make_optimizer(model, cfg)
 
-_, _, tokenizer = shakespeare_loader('data/shakespeare.txt', 32, cfg.max_seq_len, split='val')
+tokenizer = None
+for _, tok in shakespeare_loader('data/shakespeare.txt', 32, cfg.max_seq_len, split='val'):
+    tokenizer = tok
+    break
 
 def gen(split):
     for batch, _ in shakespeare_loader('data/shakespeare.txt', 32, cfg.max_seq_len, split=split):
@@ -190,7 +196,11 @@ cfg.soft_train = False   # hard mode for inference
 model = DWAModel(cfg, nnx.Rngs(0))
 # model = load_checkpoint(model, path)  # uncomment after training
 
-_, _, tokenizer = shakespeare_loader('data/shakespeare.txt', 32, cfg.max_seq_len, split='val')
+tokenizer = None
+for _, tok in shakespeare_loader('data/shakespeare.txt', 32, cfg.max_seq_len, split='val'):
+    tokenizer = tok
+    break
+
 prompt_tokens = jnp.array(tokenizer.encode('ROMEO:'))[None, :]  # (1, seq_len)
 out = generate(model, prompt_tokens, max_new_tokens=200, temperature=0.8, top_k=40)
 print(tokenizer.decode(out[0]))
@@ -212,7 +222,7 @@ cfg.soft_train = False   # or True for soft validation
 model = DWAModel(cfg, nnx.Rngs(0))
 # model = load_checkpoint(model, path)  # after training
 
-_, val_iter, tok = shakespeare_loader('data/shakespeare.txt', 32, cfg.max_seq_len, split='val')
+val_iter = shakespeare_loader('data/shakespeare.txt', 32, cfg.max_seq_len, split='val')
 losses = []
 for i, (batch, _) in zip(range(50), val_iter):
     lp = jax.nn.log_softmax(model(jax.nn.one_hot(batch[:, :-1], cfg.d_input)), axis=-1)
