@@ -235,7 +235,8 @@ def _generate_step(
     """Single JIT-compiled generation step. Returns (next_token, new_rng_key)."""
     cfg = model.config
     x_onehot = jax.nn.one_hot(context, cfg.d_input)
-    logits = model(x_onehot, use_sigmoid=True, lambda_sharp=5.0, soft=soft)
+    # valid_len=pos: only positions 0..pos-1 are real tokens (rest are padding)
+    logits = model(x_onehot, use_sigmoid=True, lambda_sharp=5.0, soft=soft, valid_len=pos)
 
     # Logit at position (pos-1) predicts token at position pos
     next_logits = logits[:, pos - 1, :] / temperature
