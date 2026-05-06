@@ -220,6 +220,51 @@ def train_step(
     return metrics
 
 
+# ─── Text generation ────────────────────────────────────────────────────────────
+
+def generate(
+    model,
+    prompt_tokens: jax.Array,   # (1, prompt_len) int32
+    max_new_tokens: int = 200,
+    temperature: float = 0.8,
+    top_k: int | None = None,
+    soft: bool = False,
+    seed: int = 42,
+) -> jax.Array:
+    """
+    Autoregressive generation. Returns (1, prompt_len + max_new_tokens) int32.
+
+    Uses hard mode by default (efficient inference). Set soft=True to use
+    the soft forward pass instead.
+    """
+    cfg = model.config
+    tokens = prompt_tokens
+    rng = jax.random.PRNGKey(seed)
+
+    for _ in range(max_new_tokens):
+        # Crop to max_seq_len if context grew too long
+        if tokens.shape[1] > cfg.max_seq_len:
+            tokens = tokens[:, -cfg.max_seq_len:]
+
+        x_onehot = jax.nn.one_hot(tokens, cfg.d_input)
+        logits = model(x_onehot, use_sigmoid=True, lambda_sharp=5.0, soft=soft)
+
+        # Last position logits
+        next_logits = logits[:, -1, :] / temperature
+
+        # Optional top-k filtering
+        if top_k is not None:
+            top_vals = jnp.sort(next_logits, axis=-1)[:, -top_k:]
+            threshold = top_vals[:, 0:1]
+            next_logits = jnp.where(next_logits >= threshold, next_logits, -1e10)
+
+        rng, subkey = jax.random.split(rng)
+        next_token = jax.random.categorical(subkey, next_logits, axis=-1)
+        tokens = jnp.concatenate([tokens, next_token[:, None]], axis=1)
+
+    return tokens
+
+
 # ─── Training loop ────────────────────────────────────────────────────────────
 
 def train_loop(
@@ -229,6 +274,11 @@ def train_loop(
     total_steps: int,
     log_every: int = 100,
     seed: int = 0,
+    generate_every: int = 0,
+    tokenizer=None,
+    generate_prompt: str | None = None,
+    generate_max_tokens: int = 200,
+    generate_temperature: float = 0.8,
 ):
     cfg      = model.config
     soft     = getattr(cfg, 'soft_train', False)
@@ -237,9 +287,14 @@ def train_loop(
     _rotator = None  # lazily init with real batch size on first step
 
     for step, batch in zip(range(total_steps), data_iter):
+        # Unwrap (batch_array, tokenizer) tuples from shakespeare_loader
+        if isinstance(batch, tuple):
+            batch = batch[0]
         t0 = time.time()
 
-        if cfg.reset_interval > 0 and step > 0 and step % cfg.reset_interval == 0:
+        # Codebook resets only in hard mode — soft mode gives every vector
+        # gradients each step, so low EMA just means natural sparsity, not death.
+        if not soft and cfg.reset_interval > 0 and step > 0 and step % cfg.reset_interval == 0:
             resets += reset_dead_vectors(model, rng)
 
         use_sigmoid, lambda_sharp, lambda_entropy_eff = get_phase_params(step, cfg)
@@ -267,3 +322,14 @@ def train_loop(
             msg.append(f"lent={lambda_entropy_eff:.4f}  resets={resets}")
             msg.append(f"t={int((time.time()-t0)*1000)}ms")
             print("  ".join(msg))
+
+        # Periodic text generation
+        if generate_every > 0 and step > 0 and step % generate_every == 0 and tokenizer is not None:
+            prompt = generate_prompt if generate_prompt else ""
+            prompt_tokens = jnp.array(tokenizer.encode(prompt))[None, :]  # (1, seq_len)
+            if prompt_tokens.shape[1] == 0:
+                prompt_tokens = jnp.zeros((1, 1), dtype=jnp.int32)
+            out = generate(model, prompt_tokens, generate_max_tokens,
+                           temperature=generate_temperature, soft=soft)
+            text = tokenizer.decode(out[0])
+            print(f"  [{step}] >> {text}")

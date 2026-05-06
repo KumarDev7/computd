@@ -1,8 +1,8 @@
 # DWA Model — Current Progress & Resumption Guide
 
-**Last updated:** 2026-05-05  
+**Last updated:** 2026-05-06  
 **Branch:** master  
-**Status:** Both hard and soft modes verified on GPU. Ready for TPU training.
+**Status:** Both hard and soft modes verified on GPU. Autoregressive generation added. Ready for TPU training.
 
 ---
 
@@ -106,7 +106,7 @@ Both converging on similar PPL — the soft mode will catch up as training conti
 
 ## Commands to Resume Training
 
-### Hard mode (GPU)
+### Hard mode (GPU) — with generation samples
 ```bash
 source .venv/bin/activate
 python -c "
@@ -121,15 +121,26 @@ cfg.soft_train = False   # hard mode
 model = DWAModel(cfg, nnx.Rngs(0))
 opt = make_optimizer(model, cfg)
 
+_, _, tokenizer = shakespeare_loader('data/shakespeare.txt', 32, cfg.max_seq_len, split='val')
+
 def gen(split):
     for batch, _ in shakespeare_loader('data/shakespeare.txt', 32, cfg.max_seq_len, split=split):
         yield batch
 
-train_loop(model, opt, gen('train'), total_steps=20000, log_every=500)
+train_loop(
+    model, opt, gen('train'),
+    total_steps=20000,
+    log_every=500,
+    generate_every=2000,
+    tokenizer=tokenizer,
+    generate_prompt='ROMEO:',
+    generate_max_tokens=200,
+    generate_temperature=0.8,
+)
 "
 ```
 
-### Soft mode (TPU / GPU)
+### Soft mode (TPU / GPU) — with generation samples
 ```bash
 source .venv/bin/activate
 python -c "
@@ -144,11 +155,45 @@ cfg.soft_train = True    # soft mode — all GEMMs, no gather
 model = DWAModel(cfg, nnx.Rngs(0))
 opt = make_optimizer(model, cfg)
 
+_, _, tokenizer = shakespeare_loader('data/shakespeare.txt', 32, cfg.max_seq_len, split='val')
+
 def gen(split):
     for batch, _ in shakespeare_loader('data/shakespeare.txt', 32, cfg.max_seq_len, split=split):
         yield batch
 
-train_loop(model, opt, gen('train'), total_steps=20000, log_every=500)
+train_loop(
+    model, opt, gen('train'),
+    total_steps=20000,
+    log_every=500,
+    generate_every=2000,
+    tokenizer=tokenizer,
+    generate_prompt='ROMEO:',
+    generate_max_tokens=200,
+    generate_temperature=0.8,
+)
+"
+```
+
+### Generation-only (standalone, after training)
+```bash
+source .venv/bin/activate
+python -c "
+import jax.numpy as jnp
+from configs.shakespeare_v2 import get_shakespeare_v2_config
+from src.model.dwa import DWAModel
+from src.training.trainer import generate
+from src.data.text_loader import shakespeare_loader
+from flax import nnx
+
+cfg = get_shakespeare_v2_config()
+cfg.soft_train = False   # hard mode for inference
+model = DWAModel(cfg, nnx.Rngs(0))
+# model = load_checkpoint(model, path)  # uncomment after training
+
+_, _, tokenizer = shakespeare_loader('data/shakespeare.txt', 32, cfg.max_seq_len, split='val')
+prompt_tokens = jnp.array(tokenizer.encode('ROMEO:'))[None, :]  # (1, seq_len)
+out = generate(model, prompt_tokens, max_new_tokens=200, temperature=0.8, top_k=40)
+print(tokenizer.decode(out[0]))
 "
 ```
 
@@ -176,6 +221,52 @@ for i, (batch, _) in zip(range(50), val_iter):
 print(f'Val PPL: {math.exp(np.mean(losses)):.3f}')
 "
 ```
+
+---
+
+## Text Generation
+
+The `generate` function supports autoregressive text generation with temperature sampling and optional top-k filtering.
+
+### `generate()` API
+```python
+from src.training.trainer import generate
+
+out = generate(
+    model,
+    prompt_tokens,       # (1, prompt_len) int32 — tokenized prompt
+    max_new_tokens=200,  # how many tokens to generate
+    temperature=0.8,      # sampling temperature (lower = more deterministic)
+    top_k=None,          # optional top-k filtering (e.g., 40 for Shakespeare)
+    soft=False,           # True to use soft forward pass (slower, matches training mode)
+    seed=42,              # PRNG seed for sampling
+)
+# out: (1, prompt_len + max_new_tokens) int32 — decode with tokenizer.decode(out[0])
+```
+
+### In-line generation during training
+Pass `generate_every`, `tokenizer`, and related args to `train_loop` to sample text periodically while training:
+
+```python
+train_loop(
+    model, opt, data_iter,
+    total_steps=20000,
+    log_every=500,
+    generate_every=2000,         # generate every N steps (0 = disabled)
+    tokenizer=tokenizer,         # from shakespeare_loader
+    generate_prompt='ROMEO:',    # prompt string (empty string = BOS)
+    generate_max_tokens=200,     # tokens to generate
+    generate_temperature=0.8,    # sampling temperature
+)
+```
+
+Output appears as: `  [2000] >> ROMEO: ...generated text...`
+
+### Generation behavior
+- Hard mode (`soft=False`): uses top-k gather, efficient for inference
+- Soft mode (`soft=True`): uses dense GEMM forward pass, matches training mode
+- Context auto-cropped to `max_seq_len` if generation exceeds context window
+- `top_k` filtering: keeps only top-k logits, sets rest to -inf before sampling
 
 ---
 
@@ -217,7 +308,7 @@ In soft mode, phase-1 warmup is unnecessary (all vectors get gradients from step
 | `src/model/pool.py` | VectorPool with EMA |
 | `src/model/parts.py` | PartA, PartB, CausalSelfAttention |
 | `src/training/losses.py` | All aux losses (diversity handles `idx=None` for soft) |
-| `src/training/trainer.py` | Phase schedule, train_step, train_loop, `soft` flag routing |
+| `src/training/trainer.py` | Phase schedule, train_step, generate, train_loop (with generation support), `soft` flag routing |
 | `src/data/text_loader.py` | Shakespeare char-level data loader |
 | `src/data/loader.py` | Synthetic task generators (random, bigram, copy) |
 | `configs/small.py` | DWAConfig dataclass (includes `soft_train` flag) |
