@@ -222,6 +222,34 @@ def train_step(
 
 # ─── Text generation ────────────────────────────────────────────────────────────
 
+@nnx.jit(static_argnums=(4, 5, 6))
+def _generate_step(
+    model,
+    context: jax.Array,        # (1, max_seq_len) int32
+    pos: jax.Array,            # scalar int — 1-indexed position to read logit from
+    rng_key: jax.Array,        # PRNG key
+    temperature: float,        # static
+    soft: bool,                # static
+    top_k: int,                # static — 0 = disabled
+) -> tuple[jax.Array, jax.Array]:
+    """Single JIT-compiled generation step. Returns (next_token, new_rng_key)."""
+    cfg = model.config
+    x_onehot = jax.nn.one_hot(context, cfg.d_input)
+    logits = model(x_onehot, use_sigmoid=True, lambda_sharp=5.0, soft=soft)
+
+    # Logit at position (pos-1) predicts token at position pos
+    next_logits = logits[:, pos - 1, :] / temperature
+
+    if top_k > 0:
+        top_vals = jnp.sort(next_logits, axis=-1)[:, -top_k:]
+        threshold = top_vals[:, 0:1]
+        next_logits = jnp.where(next_logits >= threshold, next_logits, -1e10)
+
+    rng_key, subkey = jax.random.split(rng_key)
+    next_token = jax.random.categorical(subkey, next_logits, axis=-1)
+    return next_token, rng_key
+
+
 def generate(
     model,
     prompt_tokens: jax.Array,   # (1, prompt_len) int32
@@ -234,35 +262,43 @@ def generate(
     """
     Autoregressive generation. Returns (1, prompt_len + max_new_tokens) int32.
 
-    Uses hard mode by default (efficient inference). Set soft=True to use
-    the soft forward pass instead.
+    JIT-compiled per-step with a fixed-size context window — no shape changes
+    between steps so the model compiles exactly once, then runs ~200× faster.
     """
     cfg = model.config
-    tokens = prompt_tokens
-    rng = jax.random.PRNGKey(seed)
+    prompt_len = prompt_tokens.shape[1]
+    total_len = prompt_len + max_new_tokens
 
-    for _ in range(max_new_tokens):
-        # Crop to max_seq_len if context grew too long
-        if tokens.shape[1] > cfg.max_seq_len:
-            tokens = tokens[:, -cfg.max_seq_len:]
+    token_buffer = jnp.zeros((1, total_len), dtype=jnp.int32)
+    token_buffer = token_buffer.at[:, :prompt_len].set(prompt_tokens)
 
-        x_onehot = jax.nn.one_hot(tokens, cfg.d_input)
-        logits = model(x_onehot, use_sigmoid=True, lambda_sharp=5.0, soft=soft)
+    rng_key = jax.random.PRNGKey(seed)
+    top_k_val = top_k if top_k is not None else 0
 
-        # Last position logits
-        next_logits = logits[:, -1, :] / temperature
+    for i in range(max_new_tokens):
+        pos = prompt_len + i  # absolute position of token to predict
 
-        # Optional top-k filtering
-        if top_k is not None:
-            top_vals = jnp.sort(next_logits, axis=-1)[:, -top_k:]
-            threshold = top_vals[:, 0:1]
-            next_logits = jnp.where(next_logits >= threshold, next_logits, -1e10)
+        # Sliding context window of max_seq_len tokens ending at pos
+        start = max(0, pos + 1 - cfg.max_seq_len)
+        context = token_buffer[:, start:start + cfg.max_seq_len]
+        # Pad to exactly max_seq_len if buffer shorter (early steps)
+        pad_size = cfg.max_seq_len - context.shape[1]
+        if pad_size > 0:
+            context = jnp.concatenate(
+                [context, jnp.zeros((1, pad_size), dtype=jnp.int32)], axis=1
+            )
 
-        rng, subkey = jax.random.split(rng)
-        next_token = jax.random.categorical(subkey, next_logits, axis=-1)
-        tokens = jnp.concatenate([tokens, next_token[:, None]], axis=1)
+        # 1-indexed: logit at (pos_in_window - 1) predicts pos_in_window
+        pos_in_window = pos - start + 1
 
-    return tokens
+        next_token, rng_key = _generate_step(
+            model, context,
+            jnp.array(pos_in_window),
+            rng_key, temperature, soft, top_k_val,
+        )
+        token_buffer = token_buffer.at[:, pos].set(next_token)
+
+    return token_buffer[:, :total_len]
 
 
 # ─── Training loop ────────────────────────────────────────────────────────────
