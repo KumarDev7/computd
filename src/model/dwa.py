@@ -9,7 +9,7 @@ from .assembly import WeightAssembler
 
 
 def _retrieve_per_position(z, retrieval_module, pool_vectors, k_max, T, lambda_sharp,
-                            use_sigmoid, forced_idx):
+                            use_sigmoid, forced_idx, hybrid=False):
     """
     Sequence-level retrieval (3D input) or direct retrieval (2D input).
 
@@ -21,7 +21,18 @@ def _retrieve_per_position(z, retrieval_module, pool_vectors, k_max, T, lambda_s
         only the k selected vectors (no N-wide scan per position).
 
     2D path — direct retrieval, unchanged.
+
+    hybrid=True — per-position retrieval with full GEMM compute + top-k keep.
+      • alpha: (batch, seq, k_max), idx: (batch, seq, k_max)
+      • Full similarity GEMM computed, only top-k kept for assembly.
     """
+    if hybrid and z.ndim == 3:
+        # Hybrid mode: full GEMM compute over all N, keep only top-k per position
+        alpha, top_idx, sims, alpha_raw = retrieval_module.hybrid_forward(
+            z, pool_vectors, k_max, T, lambda_sharp, use_sigmoid
+        )
+        return alpha, top_idx, sims, alpha_raw
+
     if z.ndim == 3:
         batch, seq, _ = z.shape
 
@@ -77,7 +88,7 @@ class DWABlock(nnx.Module):
         self.assembler  = WeightAssembler(d_model, d_model, r, rngs=rngs)
 
     def __call__(self, h, pool_vectors, k_max, T, lambda_sharp, use_sigmoid,
-                 forced_idx=None, soft=False):
+                 forced_idx=None, soft=False, hybrid=False):
         if self.n_heads > 0:
             h = self.attn(h)
         z = self.query_proj(h)
@@ -88,6 +99,12 @@ class DWABlock(nnx.Module):
                 z, pool_vectors, T, lambda_sharp, use_sigmoid
             )
             idx = None  # no discrete selection in soft mode
+        elif hybrid and z.ndim == 3:
+            # Hybrid mode: full GEMM compute, keep only top-k — best of both worlds.
+            alpha, idx, sims, alpha_raw = _retrieve_per_position(
+                z, self.retrieval, pool_vectors, k_max, T, lambda_sharp,
+                use_sigmoid, forced_idx, hybrid=True
+            )
         else:
             alpha, idx, sims, alpha_raw = _retrieve_per_position(
                 z, self.retrieval, pool_vectors, k_max, T, lambda_sharp, use_sigmoid, forced_idx
@@ -130,6 +147,7 @@ class DWAModel(nnx.Module):
         return_aux: bool = False,
         forced_idx: jax.Array | None = None,  # (batch, k_max) for phase-1 warmup
         soft: bool = False,                    # True → soft dense pool (TPU training)
+        hybrid: bool = False,                 # True → full GEMM compute, top-k keep
     ):
         cfg       = self.config
         pool_vecs = self.pool.vectors.value
@@ -140,7 +158,7 @@ class DWAModel(nnx.Module):
         for block in self.blocks:
             h, alpha, idx, sims, alpha_raw = block(
                 h, pool_vecs, cfg.k_max, cfg.T, lambda_sharp, use_sigmoid, forced_idx,
-                soft=soft,
+                soft=soft, hybrid=hybrid,
             )
             alpha_list.append(alpha)
             idx_list.append(idx)

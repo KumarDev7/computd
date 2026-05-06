@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-05-06  
 **Branch:** master  
-**Status:** Both hard and soft modes verified on GPU. Autoregressive generation added. Ready for TPU training.
+**Status:** Hard, soft, and hybrid modes verified on GPU. Autoregressive generation added. Ready for TPU training.
 
 ---
 
@@ -33,23 +33,24 @@ x → PartA → [DWABlock × n_layers] → PartB → logits
 
 ---
 
-## Dual-Mode System: Soft (TPU) / Hard (GPU)
+## Tri-Mode System: Hard (GPU) / Soft (TPU small) / Hybrid (TPU large)
 
-The model supports two forward passes controlled by **one config flag**:
+The model supports three forward passes controlled by **two config flags**:
 
 ```python
 # configs/small.py or shakespeare_v2
-soft_train: bool = False   # Hard: top-k + gather (GPU / inference)
-soft_train: bool = True    # Soft: dense GEMMs over all N (TPU training)
+soft_train: bool = False    # Hard: top-k + gather (GPU / inference)
+soft_train: bool = True     # Soft: dense GEMMs over all N (small TPU models)
+hybrid_train: bool = True   # Hybrid: full GEMM compute, top-k keep (7B+ TPU)
 ```
 
-### Hard Mode (`soft_train=False`) — GPU / Inference
+### Hard Mode (`soft_train=False, hybrid_train=False`) — GPU / Inference
 - Sequence-level retrieval: one query per sequence → idx shape `(batch, k_max)`
 - Gather: `(batch, k_max, D)` = **4.1 MB** per block
 - Per-position alpha computed against only the k selected vectors
 - Pool can stay on disk at inference (fetch 8 vectors per sequence)
 
-### Soft Mode (`soft_train=True`) — TPU Training
+### Soft Mode (`soft_train=True`) — TPU Training (small models)
 - No gather, no top-k: all N=512 vectors participate every step
 - Every operation is a dense GEMM (MXU-saturating on TPU)
 - alpha shape `(batch, seq, N)` — softmax over full pool
@@ -57,19 +58,50 @@ soft_train: bool = True    # Soft: dense GEMMs over all N (TPU training)
 - No codebook resets needed (impossible to have dead vectors)
 - Same checkpoint loads into either mode — flip the flag, continue
 
-### Why It Works
-At high `lambda_sharp`, softmax concentrates weight on the top-k vectors. The soft sum converges to the hard top-k result. By end of training, switching modes produces nearly identical output.
+### Hybrid Mode (`hybrid_train=True`) — TPU Training (7B+ models)
+- **Best of both worlds**: full GEMM compute over all N (MXU-saturated like soft),
+  but only top-k kept for assembly (memory-efficient like hard).
+- Compute: full per-position similarity GEMM `einsum('sbtk,snk->sbtn', queries, keys)`
+- Memory: alpha is `(batch, seq, k_max)` not `(batch, seq, N)` — same tiny size as hard
+- idx shape `(batch, seq, k_max)` — per-position top-k indices
+- No codebook resets needed (all vectors get gradient through full similarity GEMM)
+- At N=16K (7B model): hybrid alpha = 0.03 MB vs soft alpha = 65 MB per layer
+- Same checkpoint works for all modes — flip the flag, continue
+
+### Why Hybrid Works
+The full GEMM computes all N dot products (every vector evaluated, gets gradients),
+but `jax.lax.top_k` immediately discards all but k_max per position. The massive
+`(batch, seq, N)` similarity tensor is transient — only `(batch, seq, k_max)` alpha
+persists for assembly and backprop. At 7B scale, this is the difference between
+65 MB and 0.03 MB of activation memory per layer.
+
+### Mode Comparison at 7B Scale (N=16K)
+
+| Metric | Hard | Soft | Hybrid |
+|---|---|---|---|
+| Compute | top-k + gather | full GEMM | full GEMM |
+| alpha memory/layer | 0.03 MB | **65 MB** | 0.03 MB |
+| HBM reads | random gather k vecs | pool once (seq) | pool once (seq) |
+| ICI comm volume | tiny (k=8) | massive (N=16K) | tiny (k=8) |
+| Dead vector risk | yes (needs reset) | no | no |
+| Gradient to all N | no | yes | yes |
+| Use case | GPU, inference | small TPU | 7B+ TPU |
 
 ### Switching Workflow
 ```python
-# Train on TPU
+# Train on TPU (large model) — hybrid mode
+cfg.hybrid_train = True
+train_loop(model, optimizer, data_iter, total_steps=20000)
+
+# Train on TPU (small model) — soft mode
 cfg.soft_train = True
 train_loop(model, optimizer, data_iter, total_steps=20000)
 
-# Inference on GPU/CPU — same checkpoint, flip the flag
+# Inference on GPU/CPU — same checkpoint, hard mode
 cfg.soft_train = False
+cfg.hybrid_train = False
 model = load_checkpoint(path)
-logits = model(x, soft=False)   # hard top-k, 4MB gather
+logits = model(x, soft=False, hybrid=False)   # hard top-k, 4MB gather
 ```
 
 ---
@@ -102,6 +134,15 @@ Soft mode is 4.4× slower on GPU because N=512 dense einsums are compute-heavy. 
 
 Both converging on similar PPL — the soft mode will catch up as training continues.
 
+### GPU Benchmark — All Three Modes (batch=4, shakespeare_v2)
+| Mode | Step Time | alpha memory/layer | Gradient to all N |
+|---|---|---|---|
+| Hard | ~14 ms | 0.03 MB | No |
+| Soft | ~30 ms | 0.5 MB | Yes |
+| Hybrid | ~29 ms | 0.03 MB | Yes |
+
+At N=512, hybrid and soft have similar compute cost (full GEMM over all N). The hybrid advantage appears at scale: at N=16K, soft would need 65 MB/layer for alpha while hybrid stays at 0.03 MB.
+
 ---
 
 ## Commands to Resume Training
@@ -118,6 +159,7 @@ from flax import nnx
 
 cfg = get_shakespeare_v2_config()
 cfg.soft_train = False   # hard mode
+cfg.hybrid_train = False
 model = DWAModel(cfg, nnx.Rngs(0))
 opt = make_optimizer(model, cfg)
 
@@ -155,6 +197,69 @@ from flax import nnx
 
 cfg = get_shakespeare_v2_config()
 cfg.soft_train = True    # soft mode — all GEMMs, no gather
+cfg.hybrid_train = False
+model = DWAModel(cfg, nnx.Rngs(0))
+opt = make_optimizer(model, cfg)
+
+tokenizer = None
+for _, tok in shakespeare_loader('data/shakespeare.txt', 32, cfg.max_seq_len, split='val'):
+    tokenizer = tok
+    break
+
+def gen(split):
+    for batch, _ in shakespeare_loader('data/shakespeare.txt', 32, cfg.max_seq_len, split=split):
+        yield batch
+
+train_loop(
+    model, opt, gen('train'),
+    total_steps=20000,
+    log_every=500,
+    generate_every=2000,
+    tokenizer=tokenizer,
+    generate_prompt='ROMEO:',
+    generate_max_tokens=200,
+    generate_temperature=0.8,
+)
+"
+```
+
+### Hybrid mode (TPU / GPU) — full GEMM compute, top-k keep
+```bash
+source .venv/bin/activate
+python -c "
+from configs.shakespeare_v2 import get_shakespeare_v2_config
+from src.model.dwa import DWAModel
+from src.training.trainer import make_optimizer, train_loop
+from src.data.text_loader import shakespeare_loader
+from flax import nnx
+
+cfg = get_shakespeare_v2_config()
+cfg.soft_train = False   # not soft mode
+cfg.hybrid_train = True  # hybrid: full compute, sparse keep
+model = DWAModel(cfg, nnx.Rngs(0))
+opt = make_optimizer(model, cfg)
+
+tokenizer = None
+for _, tok in shakespeare_loader('data/shakespeare.txt', 32, cfg.max_seq_len, split='val'):
+    tokenizer = tok
+    break
+
+def gen(split):
+    for batch, _ in shakespeare_loader('data/shakespeare.txt', 32, cfg.max_seq_len, split=split):
+        yield batch
+
+train_loop(
+    model, opt, gen('train'),
+    total_steps=20000,
+    log_every=500,
+    generate_every=2000,
+    tokenizer=tokenizer,
+    generate_prompt='ROMEO:',
+    generate_max_tokens=200,
+    generate_temperature=0.8,
+)
+"
+```
 model = DWAModel(cfg, nnx.Rngs(0))
 opt = make_optimizer(model, cfg)
 
@@ -193,6 +298,7 @@ from flax import nnx
 
 cfg = get_shakespeare_v2_config()
 cfg.soft_train = False   # hard mode for inference
+cfg.hybrid_train = False
 model = DWAModel(cfg, nnx.Rngs(0))
 # model = load_checkpoint(model, path)  # uncomment after training
 
@@ -218,7 +324,7 @@ from src.data.text_loader import shakespeare_loader
 from flax import nnx
 
 cfg = get_shakespeare_v2_config()
-cfg.soft_train = False   # or True for soft validation
+cfg.soft_train = False   # or True for soft, or set hybrid_train=True
 model = DWAModel(cfg, nnx.Rngs(0))
 # model = load_checkpoint(model, path)  # after training
 
@@ -273,8 +379,9 @@ train_loop(
 Output appears as: `  [2000] >> ROMEO: ...generated text...`
 
 ### Generation behavior
-- Hard mode (`soft=False`): uses top-k gather, efficient for inference
-- Soft mode (`soft=True`): uses dense GEMM forward pass, matches training mode
+- Hard mode (`soft=False, hybrid=False`): uses top-k gather, efficient for inference
+- Soft mode (`soft=True`): uses dense GEMM forward pass, matches soft training
+- Hybrid mode (`hybrid=True`): uses full GEMM + top-k, matches hybrid training
 - Context auto-cropped to `max_seq_len` if generation exceeds context window
 - `top_k` filtering: keeps only top-k logits, sets rest to -inf before sampling
 
@@ -293,6 +400,9 @@ Output appears as: `  [2000] >> ROMEO: ...generated text...`
 | Soft forward pass | `retrieval.py` | `soft_forward()` — all N vectors, pure GEMMs |
 | Soft assembly | `assembly.py` | `idx=None` branch — einsum over full pool, no gather |
 | Soft EMA | `trainer.py` | Direct mean over alpha (no scatter needed) |
+| Hybrid forward pass | `retrieval.py` | `hybrid_forward()` — full GEMM compute, top-k keep |
+| Hybrid EMA | `trainer.py` | Per-position scatter for (batch, seq, k_max) idx shapes |
+| Hybrid assembly | `assembly.py` | Per-position idx path handles (batch, seq, k_max) |
 
 ---
 
@@ -304,7 +414,7 @@ Output appears as: `  [2000] >> ROMEO: ...generated text...`
 | 1,000 – 8,000 | Phase 2 (sigmoid) | True | 1.0 → 5.0 | 0.02 → 0.006 |
 | 8,000+ | Phase 3 (sharp) | True | 5.0 → 10.0 | 0.002 |
 
-In soft mode, phase-1 warmup is unnecessary (all vectors get gradients from step 0), but the schedule still works — `use_sigmoid=False` simply makes the soft alpha uniform.
+In soft/hybrid mode, phase-1 warmup is unnecessary (all vectors get gradients from step 0), but the schedule still works — `use_sigmoid=False` simply makes the soft alpha uniform.
 
 ---
 
@@ -312,16 +422,16 @@ In soft mode, phase-1 warmup is unnecessary (all vectors get gradients from step
 
 | File | Purpose |
 |---|---|
-| `src/model/dwa.py` | DWABlock, DWAModel, `_retrieve_per_position` |
-| `src/model/assembly.py` | WeightAssembler (hard + soft paths) |
-| `src/model/retrieval.py` | MultiAspectRetrieval (hard + `soft_forward` + `per_position_alpha`) |
+| `src/model/dwa.py` | DWABlock, DWAModel, `_retrieve_per_position` (hard/soft/hybrid routing) |
+| `src/model/assembly.py` | WeightAssembler (hard + soft + hybrid paths) |
+| `src/model/retrieval.py` | MultiAspectRetrieval (hard + `soft_forward` + `hybrid_forward` + `per_position_alpha`) |
 | `src/model/pool.py` | VectorPool with EMA |
 | `src/model/parts.py` | PartA, PartB, CausalSelfAttention |
-| `src/training/losses.py` | All aux losses (diversity handles `idx=None` for soft) |
-| `src/training/trainer.py` | Phase schedule, train_step, generate, train_loop (with generation support), `soft` flag routing |
+| `src/training/losses.py` | All aux losses (handles soft/hard/hybrid idx shapes) |
+| `src/training/trainer.py` | Phase schedule, train_step, generate, train_loop (hard/soft/hybrid flag routing) |
 | `src/data/text_loader.py` | Shakespeare char-level data loader |
 | `src/data/loader.py` | Synthetic task generators (random, bigram, copy) |
-| `configs/small.py` | DWAConfig dataclass (includes `soft_train` flag) |
+| `configs/small.py` | DWAConfig dataclass (includes `soft_train` and `hybrid_train` flags) |
 | `configs/shakespeare_v2.py` | Shakespeare-specific config factory |
 | `data/shakespeare.txt` | Training data |
 

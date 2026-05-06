@@ -52,7 +52,11 @@ class DWAConfig:
     n_assembly_layers: int = 1
 
     # --- Training mode ---
-    # soft_train=True  → soft dense pool (all N vectors, GEMMs only, TPU-optimal)
-    # soft_train=False → hard top-k + gather (current GPU mode)
-    # Same checkpoint works for both; switch this flag between training and inference.
+    # soft_train=True   → soft dense pool (all N vectors, GEMMs only, TPU-optimal)
+    # soft_train=False  → hard top-k + gather (current GPU mode)
+    # hybrid_train=True → full GEMM compute over all N, keep only top-k for assembly
+    #   Best of both worlds: MXU-saturated compute like soft, tiny alpha like hard.
+    #   At small scale (N<2K) pure JAX top_k suffices; at 7B+ (N>8K) use Pallas fused kernel.
+    # Same checkpoint works for all modes; switch flag between training and inference.
     soft_train: bool = False
+    hybrid_train: bool = False

@@ -128,6 +128,7 @@ def loss_fn(
     lambda_entropy_eff: float,
     forced_idx: jax.Array,
     soft: bool,
+    hybrid: bool,
 ):
     x       = batch[:, :-1]
     targets = batch[:, 1:]
@@ -135,7 +136,7 @@ def loss_fn(
     vocab_size = model.config.d_input
     x_onehot   = jax.nn.one_hot(x, vocab_size)
 
-    fwd_forced = forced_idx if (not use_sigmoid and not soft) else None
+    fwd_forced = forced_idx if (not use_sigmoid and not soft and not hybrid) else None
     logits, aux = model(
         x_onehot,
         use_sigmoid=use_sigmoid,
@@ -143,6 +144,7 @@ def loss_fn(
         forced_idx=fwd_forced,
         return_aux=True,
         soft=soft,
+        hybrid=hybrid,
     )
 
     log_probs = jax.nn.log_softmax(logits, axis=-1)
@@ -150,8 +152,8 @@ def loss_fn(
         jnp.sum(jax.nn.one_hot(targets, vocab_size) * log_probs, axis=-1)
     )
 
-    # Compute aux losses in phase-2 (hard) OR always in soft mode
-    if use_sigmoid or soft:
+    # Compute aux losses in phase-2 (hard) OR always in soft/hybrid mode
+    if use_sigmoid or soft or hybrid:
         aux_losses = compute_aux_losses(
             model,
             aux["alpha"],
@@ -170,8 +172,8 @@ def loss_fn(
     return total_loss, (metrics, aux)
 
 
-# use_sigmoid and soft are static -> at most 4 jit compilations over full training
-@nnx.jit(static_argnums=(3, 4))
+# use_sigmoid, soft, hybrid are static -> at most 8 jit compilations over full training
+@nnx.jit(static_argnums=(3, 4, 8))
 def train_step(
     model: nnx.Module,
     optimizer: nnx.Optimizer,
@@ -181,16 +183,17 @@ def train_step(
     lambda_sharp: float,
     lambda_entropy_eff: float,
     forced_idx: jax.Array,
+    hybrid: bool,
 ):
     grad_fn = nnx.value_and_grad(
         loss_fn, argnums=nnx.DiffState(0, nnx.Param), has_aux=True
     )
     (total_loss, (metrics, aux)), grads = grad_fn(
-        model, batch, use_sigmoid, lambda_sharp, lambda_entropy_eff, forced_idx, soft
+        model, batch, use_sigmoid, lambda_sharp, lambda_entropy_eff, forced_idx, soft, hybrid
     )
     optimizer.update(model, grads)
 
-    # EMA update -- soft and hard modes have different alpha shapes.
+    # EMA update -- soft, hard, and hybrid modes have different alpha/idx shapes.
     N         = model.pool.N
     alpha_all = aux.get("alpha_all", [aux["alpha"]])
     idx_all   = aux.get("idx_all",   [aux["idx"]])
@@ -200,10 +203,18 @@ def train_step(
         # Soft mode: alpha is (batch, seq, N) -- direct mean, no scatter needed.
         all_alpha = jnp.stack(alpha_all)          # (n_blocks, batch, seq, N)
         alpha_sum = all_alpha.mean(axis=(0, 1, 2)) # (N,) -- mean over blocks/batch/seq
+    elif idx_all[0].ndim == 3 and idx_all[0].shape[1] > 1:
+        # Hybrid mode (or hard per-position): idx is (batch, seq, k_max), alpha is (batch, seq, k_max)
+        # Scatter per-position alpha into N-dim using per-position idx.
+        all_idx   = jnp.stack(idx_all)    # (n_blocks, batch, seq, k_max)
+        all_alpha = jnp.stack(alpha_all)   # (n_blocks, batch, seq, k_max)
+        alpha_sum = jnp.zeros(N).at[all_idx.reshape(-1)].add(
+            all_alpha.reshape(-1) / (all_idx.size)
+        )
     else:
-        # Hard mode: scatter alpha into N-dim using idx.
-        all_idx   = jnp.stack(idx_all)    # (n_blocks, batch, [seq,] k_max)
-        all_alpha = jnp.stack(alpha_all)   # (n_blocks, batch, [seq,] k_max)
+        # Hard mode (sequence-level): idx is (batch, k_max), alpha is (batch, seq, k_max)
+        all_idx   = jnp.stack(idx_all)    # (n_blocks, batch, k_max) or (n_blocks, batch, seq, k_max)
+        all_alpha = jnp.stack(alpha_all)   # matching shape
         if all_idx.ndim == 3:
             # Sequence-level idx: sum alpha over seq before scattering
             all_alpha = all_alpha.sum(axis=2)
@@ -228,6 +239,7 @@ def generate(
     temperature: float = 0.8,
     top_k: int | None = None,
     soft: bool = False,
+    hybrid: bool = False,
     seed: int = 42,
 ) -> jax.Array:
     """
@@ -266,7 +278,7 @@ def generate(
 
             # Full forward pass on fixed-shape buffer -- compiles once
             x_onehot = jax.nn.one_hot(buffer, d_input)  # (1, max_seq_len, d_input)
-            logits = model(x_onehot, use_sigmoid=True, lambda_sharp=5.0, soft=soft)
+            logits = model(x_onehot, use_sigmoid=True, lambda_sharp=5.0, soft=soft, hybrid=hybrid)
 
             # Sample at position pos (last real token predicts pos+1)
             next_logits = jax.lax.dynamic_slice(
@@ -320,6 +332,7 @@ def train_loop(
 ):
     cfg      = model.config
     soft     = getattr(cfg, 'soft_train', False)
+    hybrid   = getattr(cfg, 'hybrid_train', False)
     rng      = np.random.default_rng(seed)
     resets   = 0
     _rotator = None  # lazily init with real batch size on first step
@@ -330,31 +343,32 @@ def train_loop(
             batch = batch[0]
         t0 = time.time()
 
-        # Codebook resets only in hard mode -- soft mode gives every vector
+        # Codebook resets only in hard mode -- soft/hybrid mode gives every vector
         # gradients each step, so low EMA just means natural sparsity, not death.
-        if not soft and cfg.reset_interval > 0 and step > 0 and step % cfg.reset_interval == 0:
+        if not soft and not hybrid and cfg.reset_interval > 0 and step > 0 and step % cfg.reset_interval == 0:
             resets += reset_dead_vectors(model, rng)
 
         use_sigmoid, lambda_sharp, lambda_entropy_eff = get_phase_params(step, cfg)
 
-        # Rotator only needed in hard mode (soft mode doesn't use forced_idx)
-        if not soft:
+        # Rotator only needed in hard mode (soft/hybrid don't use forced_idx in phase 1 warmup)
+        if not soft and not hybrid:
             if _rotator is None:
                 _rotator = Phase1Rotator(cfg.N, batch.shape[0], cfg.k_max, seed=seed)
             forced_idx = _rotator.next() if not use_sigmoid else _rotator.dummy()
         else:
             if _rotator is None:
                 _rotator = Phase1Rotator(cfg.N, batch.shape[0], cfg.k_max, seed=seed)
-            forced_idx = _rotator.dummy()  # ignored by soft_forward
+            forced_idx = _rotator.dummy()  # ignored by soft/hybrid forward
 
         metrics = train_step(
             model, optimizer, batch,
-            use_sigmoid, soft, lambda_sharp, lambda_entropy_eff, forced_idx
+            use_sigmoid, soft, lambda_sharp, lambda_entropy_eff, forced_idx, hybrid
         )
         # device_get only at log points -- keeps GPU async between steps
         if step % log_every == 0:
             m = jax.device_get(metrics)
-            msg = [f"step={step:05d}  soft={soft}"]
+            mode = "soft" if soft else "hybrid" if hybrid else "hard"
+            msg = [f"step={step:05d}  mode={mode}"]
             for k, v in sorted(m.items()):
                 msg.append(f"{k}={float(v):.4f}")
             msg.append(f"lent={lambda_entropy_eff:.4f}  resets={resets}")
@@ -368,6 +382,6 @@ def train_loop(
             if prompt_tokens.shape[1] == 0:
                 prompt_tokens = jnp.zeros((1, 1), dtype=jnp.int32)
             out = generate(model, prompt_tokens, generate_max_tokens,
-                           temperature=generate_temperature, soft=soft)
+                           temperature=generate_temperature, soft=soft, hybrid=hybrid)
             text = tokenizer.decode(out[0])
             print(f"  [{step}] >> {text}")

@@ -34,17 +34,28 @@ def selection_entropy_loss(alpha_raw: jax.Array) -> jax.Array:
 def diversity_loss(sims: jax.Array, alpha: jax.Array, idx) -> jax.Array:
     """
     Prevent key collapse: penalize high average similarity among retrieved vectors.
-    Returns 0 in soft mode (idx=None) — all N vectors are active, collapse impossible.
+    Returns 0 in soft mode (idx=None) -- all N vectors are active, collapse impossible.
+    Handles hybrid mode where sims is (batch, N) but idx is (batch, seq, k_max).
     """
     if idx is None:
         return jnp.array(0.0)
     N = sims.shape[-1]
     k = idx.shape[-1]
-    sims_2d  = sims.reshape(-1, N)
-    idx_2d   = idx.reshape(-1, k)
-    n        = sims_2d.shape[0]
-    retrieved_sims = sims_2d[jnp.arange(n)[:, None], idx_2d]  # (n, k_max)
-    return jnp.mean(jnp.mean(retrieved_sims, axis=-1) ** 2)
+
+    if sims.ndim == 2 and idx.ndim == 3:
+        # Hybrid mode: sims is (batch, N), idx is (batch, seq, k_max)
+        # Use seq-mean sims with flattened per-position idx per batch sample
+        batch_size = sims.shape[0]
+        idx_flat = idx.reshape(batch_size, -1)  # (batch, seq*k_max)
+        retrieved_sims = sims[jnp.arange(batch_size)[:, None], idx_flat]
+        return jnp.mean(jnp.mean(retrieved_sims, axis=-1) ** 2)
+    else:
+        # Hard mode: both sims and idx share same leading dims after reshape
+        sims_2d  = sims.reshape(-1, N)
+        idx_2d   = idx.reshape(-1, k)
+        n        = sims_2d.shape[0]
+        retrieved_sims = sims_2d[jnp.arange(n)[:, None], idx_2d]  # (n, k_max)
+        return jnp.mean(jnp.mean(retrieved_sims, axis=-1) ** 2)
 
 
 def norm_loss(model) -> jax.Array:

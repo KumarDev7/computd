@@ -114,6 +114,58 @@ class MultiAspectRetrieval(nnx.Module):
         # Collapse seq dim for aux-loss compatibility (diversity_loss, entropy_loss)
         return alpha, sims_w.mean(axis=1), alpha_raw.mean(axis=1)
 
+    def hybrid_forward(
+        self,
+        z: jax.Array,        # (batch, seq, d_A)
+        vectors: jax.Array,  # (N, D)
+        k_max: int,
+        T: float = 1.0,
+        lambda_sharp: float = 1.0,
+        use_sigmoid: bool = True,
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        """
+        Hybrid retrieval: compute ALL N dot products (GEMM-saturated, like soft)
+        but keep only top-k for assembly (memory-efficient, like hard).
+
+        TPU-optimal: the full similarity GEMM saturates the MXU, then top_k
+        immediately discards the (B, seq, N) intermediate — only (B, seq, k_max)
+        is materialized for assembly and backprop.
+
+        Returns:
+          alpha:         (batch, seq, k_max) — top-k weights (tiny, same as hard)
+          top_idx:       (batch, seq, k_max) — indices of top-k vectors
+          sims_seq:      (batch, N)          — seq-mean sims (for aux losses)
+          alpha_raw_seq: (batch, N)          — seq-mean raw scores (for aux losses)
+        """
+        # Keys for all N vectors: (S, N, d_k)
+        keys = jnp.einsum('skd,nd->snk', self.W_K.value, vectors)
+        keys = keys / (jnp.linalg.norm(keys, axis=-1, keepdims=True) + 1e-8)
+
+        # Per-position queries: (S, batch, seq, d_k)
+        queries = jnp.einsum('skd,btd->sbtk', self.W_Q.value, z)
+        queries = queries / (jnp.linalg.norm(queries, axis=-1, keepdims=True) + 1e-8)
+
+        # Per-position similarities to all N: (S, batch, seq, N)
+        sims = jnp.einsum('sbtk,snk->sbtn', queries, keys)
+        w      = jax.nn.softmax(self.aspect_logits.value)
+        sims_w = jnp.einsum('s,sbtn->btn', w, sims)  # (batch, seq, N)
+
+        if use_sigmoid:
+            tau       = jnp.dot(w, self.tau.value)
+            gate      = jax.nn.sigmoid(lambda_sharp * (sims_w - tau))
+            alpha_raw = gate * jnp.exp(sims_w / T)
+        else:
+            alpha_raw = jnp.exp(sims_w / T)
+
+        # Top-k: full GEMM computed, but only keep k_max per position
+        top_vals, top_idx = jax.lax.top_k(alpha_raw, k_max)  # (batch, seq, k_max)
+
+        # Normalize only over top-k (not over all N — saves the massive softmax)
+        alpha = top_vals / (jnp.sum(top_vals, axis=-1, keepdims=True) + 1e-8)
+
+        # Collapse seq dim for aux-loss compatibility
+        return alpha, top_idx, sims_w.mean(axis=1), alpha_raw.mean(axis=1)
+
     def per_position_alpha(
         self,
         z: jax.Array,              # (batch, seq, d_A)
