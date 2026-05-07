@@ -96,13 +96,12 @@ def make_optimizer(model: nnx.Module, config, mesh=None) -> nnx.Optimizer:
     Args:
         model:  NNX model whose nnx.Param variables will be optimized.
         config: Training config (lr_*, etc.).
-        mesh:   Optional JAX Mesh.  When provided, ``nnx.Optimizer`` is
-                constructed inside a ``with mesh:`` context so that XLA/GSPMD
-                can see the sharding layout and allocate Adam mu/nu state
-                (via ``zeros_like``) distributed across devices — matching
-                the param sharding already set by ``init_model_cpu_sharded``.
-                Without this, optax tries to materialize the full optimizer
-                state on a single core, causing RESOURCE_EXHAUSTED at 7B.
+        mesh:   Optional JAX Mesh.  When provided, ``tx.init`` is wrapped in
+                ``jax.jit`` so XLA's GSPMD sharding pass runs and allocates
+                Adam mu/nu state distributed across devices — matching the
+                param sharding set by ``init_model_cpu_sharded``.
+                Without this, optax calls ``jnp.zeros_like`` eagerly which
+                dispatches to a single device, causing RESOURCE_EXHAUSTED.
     """
     def _leaf_label(path, _leaf):
         path_str = "/".join(str(p.key) if hasattr(p, "key") else str(p) for p in path)
@@ -131,12 +130,50 @@ def make_optimizer(model: nnx.Module, config, mesh=None) -> nnx.Optimizer:
         param_labels=label_fn,
     )
 
-    # Construct optimizer inside mesh context so GSPMD distributes optimizer
-    # state (mu + nu) across the mesh instead of materialising on one core.
-    if mesh is not None:
-        with mesh:
-            return nnx.Optimizer(model, tx, wrt=nnx.Param)
-    return nnx.Optimizer(model, tx, wrt=nnx.Param)
+    if mesh is None:
+        # Single-device or GPU path — eager init is fine.
+        return nnx.Optimizer(model, tx, wrt=nnx.Param)
+
+    # ── Multi-device TPU path ────────────────────────────────────────────
+    # Problem: nnx.Optimizer.__init__ calls tx.init(params) eagerly.
+    # In eager mode jnp.zeros_like dispatches to a single XLA device —
+    # GSPMD sharding annotations on the params are ignored, so the full
+    # mu/nu buffers land on one core and exhaust its 16 GB HBM.
+    #
+    # Fix: JIT-compile tx.init so XLA runs its sharding propagation pass.
+    # The resulting opt_state carries the same NamedSharding as the params
+    # (pool → P('pool',None), W_K → P(None,None,'pool'), others → P()).
+    #
+    # We then build the nnx.Optimizer normally and overwrite its internal
+    # opt_state with the JIT-initialised (properly sharded) version.
+    param_state = nnx.state(model, nnx.Param)
+
+    @jax.jit
+    def _jit_init(params):
+        return tx.init(params)
+
+    opt_state_raw = _jit_init(param_state)
+    import gc; gc.collect()
+    print("[optimizer] JIT-compiled tx.init complete — opt state sharded across mesh")
+
+    # ── Bypass nnx.Optimizer.__init__ to avoid a second eager tx.init call ───
+    # nnx.Optimizer.__init__ always calls tx.init(params) eagerly; with 7B
+    # sharded params that second eager call would OOM just like the first.
+    # We use object.__new__ to skip __init__ entirely and set each attribute
+    # to match what Flax's Optimizer.__init__ produces exactly.
+    #
+    # From flax/nnx/training/optimizer.py __init__:
+    #   self.step      = OptState(jnp.array(0, dtype=jnp.uint32))
+    #   self.tx        = tx
+    #   self.opt_state = nnx.data(to_opt_state(tx.init(nnx.state(model, wrt))))
+    #   self.wrt       = wrt
+    from flax.nnx.training.optimizer import OptState, to_opt_state
+    opt = object.__new__(nnx.Optimizer)
+    opt.step      = OptState(jnp.array(0, dtype=jnp.uint32))
+    opt.tx        = tx
+    opt.opt_state = nnx.data(to_opt_state(opt_state_raw))
+    opt.wrt       = nnx.Param
+    return opt
 
 
 # --- Loss & train step -----------------------------------------------------------
