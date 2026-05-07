@@ -98,7 +98,7 @@ def main():
     else:
         model = DWAModel(cfg, nnx.Rngs(0))
 
-    opt = make_optimizer(model, cfg)
+    opt = make_optimizer(model, cfg, mesh=mesh if use_pool_parallel else None)
 
     # ── Data ─────────────────────────────────────────────────────────────
     from src.data.text_loader import shakespeare_loader

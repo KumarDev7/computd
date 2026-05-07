@@ -90,7 +90,20 @@ def reset_dead_vectors(model, rng: np.random.Generator) -> int:
 
 # --- Optimizer -------------------------------------------------------------------
 
-def make_optimizer(model: nnx.Module, config) -> nnx.Optimizer:
+def make_optimizer(model: nnx.Module, config, mesh=None) -> nnx.Optimizer:
+    """Build the multi-group optimizer.
+
+    Args:
+        model:  NNX model whose nnx.Param variables will be optimized.
+        config: Training config (lr_*, etc.).
+        mesh:   Optional JAX Mesh.  When provided, ``nnx.Optimizer`` is
+                constructed inside a ``with mesh:`` context so that XLA/GSPMD
+                can see the sharding layout and allocate Adam mu/nu state
+                (via ``zeros_like``) distributed across devices — matching
+                the param sharding already set by ``init_model_cpu_sharded``.
+                Without this, optax tries to materialize the full optimizer
+                state on a single core, causing RESOURCE_EXHAUSTED at 7B.
+    """
     def _leaf_label(path, _leaf):
         path_str = "/".join(str(p.key) if hasattr(p, "key") else str(p) for p in path)
         if "pool" in path_str:
@@ -117,6 +130,12 @@ def make_optimizer(model: nnx.Module, config) -> nnx.Optimizer:
         },
         param_labels=label_fn,
     )
+
+    # Construct optimizer inside mesh context so GSPMD distributes optimizer
+    # state (mu + nu) across the mesh instead of materialising on one core.
+    if mesh is not None:
+        with mesh:
+            return nnx.Optimizer(model, tx, wrt=nnx.Param)
     return nnx.Optimizer(model, tx, wrt=nnx.Param)
 
 
