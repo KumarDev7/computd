@@ -77,6 +77,36 @@ class MeshContext:
         self.w_k_sharding = NamedSharding(mesh, P(None, None, 'pool'))
 
 
+# ── BF16 param cast ──────────────────────────────────────────────────────
+
+def cast_params_bf16(model) -> None:
+    """
+    Cast all nnx.Param tensors to bfloat16 in-place, preserving sharding.
+
+    Why bfloat16 params:
+      - Halves model memory (f32 \u2192 bf16) \u2014 saves ~3 GB/core at 7B
+      - Optimizer state (mu + nu) is zeros_like(params) \u2192 also bf16
+        \u2192 total optimizer memory halved, freeing ~6 GB/core at 7B scale
+      - TPU MXU natively operates in bf16; no compute cost
+      - Numerically safe: bf16 has same exponent range as f32
+
+    EMAState and other non-Param variables are left in f32 (they don't
+    contribute to optimizer state and need full precision for EMA updates).
+
+    JAX's astype() preserves existing per-tensor sharding automatically,
+    so pool vectors (P('pool',None)) and W_K (P(None,None,'pool')) keep
+    their shard layout after the cast.
+    """
+    param_state = nnx.state(model, nnx.Param)
+    bf16_state = jax.tree_util.tree_map(
+        lambda x: x.astype(jnp.bfloat16) if (
+            hasattr(x, 'dtype') and x.dtype == jnp.float32
+        ) else x,
+        param_state,
+    )
+    nnx.update(model, bf16_state)
+
+
 # ── Initial state sharding ─────────────────────────────────────────────────
 
 def shard_initial_state(model, ctx: MeshContext) -> None:
@@ -208,6 +238,12 @@ def init_model_cpu_sharded(cfg, ctx: MeshContext, seed: int = 0) -> "DWAModel":
         f"({wk_total_bytes / 2**20:.1f} MB total → "
         f"{wk_per_core / 2**20:.1f} MB/core)"
     )
+
+    # ── 7. Cast all trainable params to bf16 ─────────────────────────────
+    # Must happen AFTER sharding so per-tensor shard specs are preserved.
+    # This halves optimizer state (mu+nu) from f32 to bf16 — ~6 GB saved/core.
+    cast_params_bf16(model)
+    print("[sharding] params cast to bf16 — optimizer state will be bf16")
     return model
 
 
