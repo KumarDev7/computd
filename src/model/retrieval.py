@@ -2,6 +2,8 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
+from src.kernels.fused_retrieval import fused_weighted_similarity
+
 
 class MultiAspectRetrieval(nnx.Module):
     """
@@ -97,10 +99,9 @@ class MultiAspectRetrieval(nnx.Module):
         queries = jnp.einsum('skd,btd->sbtk', self.W_Q.value, z)
         queries = queries / (jnp.linalg.norm(queries, axis=-1, keepdims=True) + 1e-8)
 
-        # Per-position similarities to all N: (S, batch, seq, N)
-        sims = jnp.einsum('sbtk,snk->sbtn', queries, keys)
+        # Fused: Σ_s w[s]*Q[s]@K[s].T → (batch, seq, N) without (S,B,T,N) peak.
         w      = jax.nn.softmax(self.aspect_logits.value)
-        sims_w = jnp.einsum('s,sbtn->btn', w, sims)  # (batch, seq, N)
+        sims_w = fused_weighted_similarity(queries, keys, w)       # (batch, seq, N)
 
         if use_sigmoid:
             tau       = jnp.dot(w, self.tau.value)
@@ -145,10 +146,10 @@ class MultiAspectRetrieval(nnx.Module):
         queries = jnp.einsum('skd,btd->sbtk', self.W_Q.value, z)
         queries = queries / (jnp.linalg.norm(queries, axis=-1, keepdims=True) + 1e-8)
 
-        # Per-position similarities to all N: (S, batch, seq, N)
-        sims = jnp.einsum('sbtk,snk->sbtn', queries, keys)
+        # Fused: Σ_s w[s]*Q[s]@K[s].T → (batch, seq, N) without (S,B,T,N) peak.
+        # TPU: Pallas Mosaic kernel (tiles in VMEM).  GPU/CPU: per-aspect loop.
         w      = jax.nn.softmax(self.aspect_logits.value)
-        sims_w = jnp.einsum('s,sbtn->btn', w, sims)  # (batch, seq, N)
+        sims_w = fused_weighted_similarity(queries, keys, w)       # (batch, seq, N)
 
         if use_sigmoid:
             tau       = jnp.dot(w, self.tau.value)
@@ -158,9 +159,7 @@ class MultiAspectRetrieval(nnx.Module):
             alpha_raw = jnp.exp(sims_w / T)
 
         # Top-k: full GEMM computed, but only keep k_max per position
-        top_vals, top_idx = jax.lax.top_k(alpha_raw, k_max)  # (batch, seq, k_max)
-
-        # Normalize only over top-k (not over all N — saves the massive softmax)
+        top_vals, top_idx = jax.lax.top_k(alpha_raw, k_max)       # (batch, seq, k_max)
         alpha = top_vals / (jnp.sum(top_vals, axis=-1, keepdims=True) + 1e-8)
 
         # Collapse seq dim for aux-loss compatibility

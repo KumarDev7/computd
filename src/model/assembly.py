@@ -73,10 +73,11 @@ class WeightAssembler(nnx.Module):
 
     def __call__(
         self,
-        h_A: jax.Array,     # (batch, [seq,] d_A)
-        alpha: jax.Array,   # (batch, [seq,] k_max)
-        idx: jax.Array,     # (batch, k_max) seq-level  OR  (batch, seq, k_max) per-position
-        vectors: jax.Array, # (N, D)
+        h_A: jax.Array,                        # (batch, [seq,] d_A)
+        alpha: jax.Array,                       # (batch, [seq,] k_max)
+        idx: jax.Array,                         # (batch, k_max) or (batch, seq, k_max)
+        vectors: jax.Array,                     # (N, D)
+        pre_gathered_vecs: jax.Array | None = None,  # (batch, seq, k_max, D) — pool-parallel
     ) -> jax.Array:
         """Returns h_mid (batch, [seq,] d_B) after middle layer."""
         gamma    = self.gamma.value
@@ -96,10 +97,14 @@ class WeightAssembler(nnx.Module):
             b_delta = jnp.einsum('bsn,nj->bsj', alpha, b_pool)       # (b, s, d_B)
             h_base  = jnp.einsum('bsd,id->bsi', h_A, self.W_base.value) + self.b_base.value
         else:
-            # ── Hard / Hybrid mode: gather the selected vectors, then assemble.
-            # Hard: idx is (batch, k_max) seq-level or (batch, seq, k_max) per-position.
-            # Hybrid: idx is always (batch, seq, k_max) per-position.
-            selected = vectors[idx]   # (batch, k_max, D)  or  (batch, seq, k_max, D)
+            # ── Hard / Hybrid / Pool-parallel mode ───────────────────────────
+            # pre_gathered_vecs: provided by pool-parallel shard_map (avoids
+            #   a second distributed gather from the sharded pool).
+            # Otherwise: standard gather from the (possibly replicated) pool.
+            if pre_gathered_vecs is not None:
+                selected = pre_gathered_vecs   # (batch, seq, k_max, D) — already fetched
+            else:
+                selected = vectors[idx]   # (batch, k_max, D) or (batch, seq, k_max, D)
             U      = selected[..., :self._off_V].reshape(*selected.shape[:-1], self.d_B, self.r)
             V      = selected[..., self._off_V:self._off_b].reshape(*selected.shape[:-1], self.r, self.d_A)
             b_vecs = selected[..., self._off_b:self._end_b]

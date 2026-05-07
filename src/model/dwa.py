@@ -88,19 +88,17 @@ class DWABlock(nnx.Module):
         self.assembler  = WeightAssembler(d_model, d_model, r, rngs=rngs)
 
     def __call__(self, h, pool_vectors, k_max, T, lambda_sharp, use_sigmoid,
-                 forced_idx=None, soft=False, hybrid=False):
+                 forced_idx=None, soft=False, hybrid=False, pre_gathered_vecs=None):
         if self.n_heads > 0:
             h = self.attn(h)
         z = self.query_proj(h)
 
         if soft and z.ndim == 3:
-            # Soft mode: all N vectors, pure GEMMs, no gather, no top-k.
             alpha, sims, alpha_raw = self.retrieval.soft_forward(
                 z, pool_vectors, T, lambda_sharp, use_sigmoid
             )
-            idx = None  # no discrete selection in soft mode
+            idx = None
         elif hybrid and z.ndim == 3:
-            # Hybrid mode: full GEMM compute, keep only top-k — best of both worlds.
             alpha, idx, sims, alpha_raw = _retrieve_per_position(
                 z, self.retrieval, pool_vectors, k_max, T, lambda_sharp,
                 use_sigmoid, forced_idx, hybrid=True
@@ -110,7 +108,10 @@ class DWABlock(nnx.Module):
                 z, self.retrieval, pool_vectors, k_max, T, lambda_sharp, use_sigmoid, forced_idx
             )
 
-        h_out = self.assembler(h, alpha, idx, pool_vectors)
+        # pre_gathered_vecs: pool-parallel path pre-fetches k_max vectors via
+        # masked-psum so assembly skips a second gather from the sharded pool.
+        h_out = self.assembler(h, alpha, idx, pool_vectors,
+                               pre_gathered_vecs=pre_gathered_vecs)
         return h_out, alpha, idx, sims, alpha_raw
 
 
