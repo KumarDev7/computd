@@ -285,10 +285,6 @@ def init_model_cpu_sharded(cfg, ctx: MeshContext, seed: int = 0) -> "DWAModel":
     )
 
     # ── 7. Cast remaining CPU params to bf16, replicate to mesh ──────────
-    # W_Q, PartA, PartB, assembly weights are still on CPU (f32).
-    # Cast them to bf16 ON CPU (cheap — host RAM is plentiful), then
-    # device_put to ctx.replicated.  Pool/W_K are already on device in
-    # bf16 and are skipped (device check).
     param_state = nnx.state(model, nnx.Param)
 
     def _cast_cpu_and_put(x):
@@ -296,10 +292,8 @@ def init_model_cpu_sharded(cfg, ctx: MeshContext, seed: int = 0) -> "DWAModel":
             return x
         devs = list(x.devices())
         if devs and devs[0].platform == 'cpu':
-            # Cast f32 → bf16 on CPU, then put on all mesh devices
             return jax.device_put(x.astype(jnp.bfloat16), ctx.replicated)
-        # Already on TPU device (pool, W_K) — already bf16, leave as-is
-        return x
+        return x  # pool / W_K already bf16 on device
 
     device_state = jax.tree_util.tree_map(_cast_cpu_and_put, param_state)
     del param_state
@@ -308,8 +302,116 @@ def init_model_cpu_sharded(cfg, ctx: MeshContext, seed: int = 0) -> "DWAModel":
     del device_state
     gc.collect()
     print("[sharding] CPU params cast bf16 + replicated to mesh")
+
+    # ── 8. Tensor-parallel sharding of PartA / PartB / attention ─────────
+    # After step 7, all params are replicated P() — each of 8 cores holds
+    # a full copy.  At 7B, replicated params ≈ 4.1 GB/core and their Adam
+    # optimizer state ≈ 8.2 GB/core, totalling ~19 GB > 16 GB HBM limit.
+    #
+    # Fix: shard large Linear kernels along the pool axis using the standard
+    # column-parallel → row-parallel (Megatron-LM) tensor-parallel pattern:
+    #   col-par kernel  P(None,'pool')  → output activation sharded
+    #   row-par kernel  P('pool',None)  → GSPMD inserts psum → output replicated
+    #
+    # Inside @nnx.jit / @nnx.jit(train_step), XLA's GSPMD compiler sees the
+    # sharded kernels and automatically inserts the all-reduce (psum) for the
+    # contracted pool dimension, so NO model code changes are needed.
+    #
+    # h flow: replicated → [col-par qkv] → sharded → [row-par proj] → replicated
+    # The h at DWABlock boundaries stays replicated, keeping it compatible with
+    # the shard_map in_spec P('data',None,None) for pool_retrieve.
+    _shard_tensor_parallel(model, ctx)
     print("[sharding] All params now on device in bf16 — optimizer state will be bf16")
     return model
+
+
+def _shard_tensor_parallel(model, ctx: "MeshContext") -> None:
+    """Shard PartA/PartB MLP and DWABlock attention weights along pool axis.
+
+    Uses column-parallel → row-parallel tensor parallelism so that each
+    pool shard holds 1/pool_size of the weight, reducing replicated param
+    memory by ~pool_size× and their optimizer state likewise.
+
+    Requires: params are already on TPU (bf16, replicated) from step 7.
+    """
+    pool_size = ctx.pool_size
+    col  = NamedSharding(ctx.mesh, P(None, 'pool'))        # (d_in, d_out/p) col-par
+    row  = NamedSharding(ctx.mesh, P('pool', None))        # (d_in/p, d_out) row-par
+    col1 = NamedSharding(ctx.mesh, P('pool',))             # (d/p,) bias for col-par
+    w3d  = NamedSharding(ctx.mesh, P(None, None, 'pool'))  # (S, d_k, d_A/p) W_Q
+
+    def _put(val, sharding):
+        return jax.device_put(val, sharding)
+
+    def _col(linear):
+        """Column-parallel: shard output dim of kernel + bias."""
+        k = linear.kernel.value
+        if k.shape[1] % pool_size != 0:
+            return
+        linear.kernel.value = _put(k, col)
+        if linear.bias is not None:
+            linear.bias.value = _put(linear.bias.value, col1)
+
+    def _row(linear):
+        """Row-parallel: shard input dim of kernel; bias stays replicated."""
+        k = linear.kernel.value
+        if k.shape[0] % pool_size != 0:
+            return
+        linear.kernel.value = _put(k, row)
+        # bias replicated — added to the full output after psum
+
+    # PartA: fc1 col-par  (d_in=65, hidden=16384) → each core (65, 16384/p)
+    #        fc2 row-par  (hidden=16384, d_A=4096) → each core (16384/p, 4096)
+    _col(model.part_a.fc1)
+    _row(model.part_a.fc2)
+
+    # PartB: fc1 col-par  (d_A=4096, hidden=16384) → each core (4096, 16384/p)
+    #        fc2 row-par  (hidden=16384, d_out=65)  → each core (16384/p, 65)
+    _col(model.part_b.fc1)
+    _row(model.part_b.fc2)
+
+    tp_bytes = 0
+    for block in model.blocks:
+        # CausalSelfAttention: qkv col-par, proj row-par
+        if block.n_heads > 0:
+            attn = block.attn
+            _col(attn.qkv)    # (d_A, 3*d_A) → each core (d_A, 3*d_A/p)
+            _row(attn.proj)   # (d_A, d_A)   → each core (d_A/p, d_A)
+            # norm weights (tiny) stay replicated
+
+        # query_proj: row-par — h is replicated P(), z output is replicated
+        # after psum, which matches shard_map in_spec P('data',None,None).
+        _row(block.query_proj)  # (d_A, d_A) → each core (d_A/p, d_A)
+
+        # W_Q: (S, d_k, d_A) → shard d_A across pool, matching the D/pool
+        # partial-key pattern already used inside the pool-parallel shard_map.
+        wq = block.retrieval.W_Q.value
+        if wq.shape[2] % pool_size == 0:
+            block.retrieval.W_Q.value = _put(wq, w3d)
+            tp_bytes += wq.nbytes // pool_size * 2  # rough bf16 savings
+
+    # Report savings
+    col_par_params = (
+        model.part_a.fc1.kernel.value.size * pool_size +  # full size
+        model.part_b.fc1.kernel.value.size * pool_size
+    )
+    row_par_params = (
+        model.part_a.fc2.kernel.value.size * pool_size +
+        model.part_b.fc2.kernel.value.size * pool_size
+    )
+    n_blocks = len(model.blocks)
+    if n_blocks > 0 and model.blocks[0].n_heads > 0:
+        attn0 = model.blocks[0].attn
+        col_par_params += attn0.qkv.kernel.value.size  * pool_size * n_blocks
+        row_par_params += attn0.proj.kernel.value.size * pool_size * n_blocks
+    row_par_params += model.blocks[0].query_proj.kernel.value.size * pool_size * n_blocks
+    total_f32_mb = (col_par_params + row_par_params) * 4 / 2**20
+    per_core_bf16_mb = (col_par_params + row_par_params) * 2 / pool_size / 2**20
+    print(
+        f"[sharding] TP sharded: {total_f32_mb:.0f} MB f32 → "
+        f"{per_core_bf16_mb:.0f} MB/core bf16 "
+        f"(params + opt state savings ≈ {per_core_bf16_mb*3:.0f} MB/core)"
+    )
 
 
 # ── Pool-parallel hybrid retrieval ────────────────────────────────────────
