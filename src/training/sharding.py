@@ -195,43 +195,43 @@ def init_model_cpu_sharded(cfg, ctx: MeshContext, seed: int = 0) -> "DWAModel":
     """
     cpu = jax.devices('cpu')[0]
 
-    # ── 1. Full init on CPU ───────────────────────────────────────────────
+    # ── 1. Full init on CPU (f32 params in host DRAM) ────────────────────
     with jax.default_device(cpu):
         model = DWAModel(cfg, nnx.Rngs(seed))
 
-    # ── 2. Extract pool arrays into numpy (host RAM, no device copy) ──────
-    pool_np = np.array(model.pool.vectors.value)    # (N, D)
-    ema_np  = np.array(model.pool.ema_usage.value)  # (N,)
+    # ── 2. Extract pool/EMA as numpy for N-axis slicing ──────────────────
+    pool_np = np.array(model.pool.vectors.value)    # (N, D) f32
+    ema_np  = np.array(model.pool.ema_usage.value)  # (N,)   f32
 
-    N, D          = pool_np.shape
-    data_size     = ctx.data_size
-    pool_size     = ctx.pool_size
-    N_per_shard   = N // pool_size
-    D_per_shard   = D // pool_size
-    assert N % pool_size == 0, (
-        f"N={N} must be divisible by pool_size={pool_size}"
-    )
-    assert D % pool_size == 0, (
-        f"D={D} must be divisible by pool_size={pool_size} for W_K sharding"
-    )
+    N, D        = pool_np.shape
+    data_size   = ctx.data_size
+    pool_size   = ctx.pool_size
+    N_per_shard = N // pool_size
+    D_per_shard = D // pool_size
+    assert N % pool_size == 0, f"N={N} must be divisible by pool_size={pool_size}"
+    assert D % pool_size == 0, f"D={D} must be divisible by pool_size={pool_size}"
 
-    # ── 3 & 4. Split in numpy, push each slice to its device ─────────────
-    # NamedSharding P('pool', None):
-    #   pool axis index j → rows [j*N_per_shard : (j+1)*N_per_shard]
-    #   data axis index i → same slice replicated on mesh.devices[i, j]
+    # ── 3 & 4. Slice pool in numpy, push as bf16 to each device ──────────
+    # CRITICAL: convert numpy slice → jnp bf16 BEFORE device_put.
+    # This ensures the device NEVER holds f32 pool vectors — only bf16.
+    # Without this, f32 pool (2.12 GB) + f32 W_K (2.45 GB) + f32 replicated
+    # params exhaust 16 GB HBM before any cast can succeed.
     pool_device_arrays = []
     ema_device_arrays  = []
     for j in range(pool_size):
-        pool_shard = pool_np[j * N_per_shard : (j + 1) * N_per_shard]  # (N/pool, D)
-        ema_shard  = ema_np[ j * N_per_shard : (j + 1) * N_per_shard]  # (N/pool,)
+        pool_shard_f32 = pool_np[j * N_per_shard : (j + 1) * N_per_shard]
+        ema_shard_f32  = ema_np[ j * N_per_shard : (j + 1) * N_per_shard]
+        # Cast pool to bf16 on CPU (numpy f32 → jnp bf16, host-side only)
+        pool_shard_bf16 = jnp.array(pool_shard_f32, dtype=jnp.bfloat16)
         for i in range(data_size):
             device = ctx.mesh.devices[i, j]
-            pool_device_arrays.append(jax.device_put(pool_shard, device))
-            ema_device_arrays.append(jax.device_put(ema_shard,  device))
+            pool_device_arrays.append(jax.device_put(pool_shard_bf16, device))
+            ema_device_arrays.append(jax.device_put(ema_shard_f32,   device))
+        del pool_shard_bf16
+    del pool_np, ema_np
+    gc.collect()
 
     # ── 5. Assemble global sharded arrays ─────────────────────────────────
-    # make_array_from_single_device_arrays owns the per-device buffers —
-    # no extra copies, no all-gather needed.
     model.pool.vectors.value = jax.make_array_from_single_device_arrays(
         shape=(N, D),
         sharding=ctx.pool_vecs,
@@ -243,29 +243,29 @@ def init_model_cpu_sharded(cfg, ctx: MeshContext, seed: int = 0) -> "DWAModel":
         arrays=ema_device_arrays,
     )
 
+    pool_bf16_per_core = N_per_shard * D * 2  # bytes, bf16
     print(
         f"[sharding] pool sharded: {pool_size} shards × "
-        f"{N_per_shard}×{D} "
-        f"({pool_np.nbytes / 2**30:.2f} GB total → "
-        f"{pool_shard.nbytes / 2**30:.2f} GB/core)"  # type: ignore[possibly-undefined]
+        f"{N_per_shard}×{D} bf16 "
+        f"({N * D * 4 / 2**30:.2f} GB f32 → "
+        f"{pool_bf16_per_core / 2**30:.2f} GB/core bf16)"
     )
 
-    # ── 6. Shard W_K (S, d_k, D) along D axis across pool shards ─────────
-    # Each pool shard j gets W_K[:, :, j*D_per_shard : (j+1)*D_per_shard].
-    # The local key GEMM einsum('skd,nd→snk') with local pool_vecs produces
-    # partial dot products; psum across 'pool' yields the correct full result.
+    # ── 6. Shard W_K along D, push as bf16 ───────────────────────────────
     wk_total_bytes = 0
     for block_i, block in enumerate(model.blocks):
-        wk_np = np.array(block.retrieval.W_K.value)  # (S, d_k, D)
+        wk_np = np.array(block.retrieval.W_K.value)   # (S, d_k, D) f32
         S_wk, dk_wk, D_wk = wk_np.shape
         assert D_wk == D, f"Block {block_i}: W_K D={D_wk} != pool D={D}"
 
         wk_device_arrays = []
         for j in range(pool_size):
-            wk_shard = wk_np[:, :, j * D_per_shard : (j + 1) * D_per_shard]  # (S, d_k, D/pool)
+            wk_shard_f32  = wk_np[:, :, j * D_per_shard : (j + 1) * D_per_shard]
+            wk_shard_bf16 = jnp.array(wk_shard_f32, dtype=jnp.bfloat16)
             for i in range(data_size):
                 device = ctx.mesh.devices[i, j]
-                wk_device_arrays.append(jax.device_put(wk_shard, device))
+                wk_device_arrays.append(jax.device_put(wk_shard_bf16, device))
+            del wk_shard_bf16
 
         block.retrieval.W_K.value = jax.make_array_from_single_device_arrays(
             shape=(S_wk, dk_wk, D_wk),
@@ -273,29 +273,42 @@ def init_model_cpu_sharded(cfg, ctx: MeshContext, seed: int = 0) -> "DWAModel":
             arrays=wk_device_arrays,
         )
         wk_total_bytes += wk_np.nbytes
+        del wk_np
+    gc.collect()
 
     wk_per_core = wk_total_bytes / pool_size
     print(
         f"[sharding] W_K sharded: {len(model.blocks)} blocks × "
-        f"({S_wk}×{dk_wk}×{D_per_shard})/core "
-        f"({wk_total_bytes / 2**20:.1f} MB total → "
-        f"{wk_per_core / 2**20:.1f} MB/core)"
+        f"({S_wk}×{dk_wk}×{D_per_shard})/core bf16 "
+        f"({wk_total_bytes / 2**20:.1f} MB f32 → "
+        f"{wk_per_core / 2**20 / 2:.1f} MB/core bf16)"
     )
 
-    # ── 7. Replicate CPU-resident params to the full mesh ────────────────────
-    # W_Q, PartA, PartB, assembly weights were init'd on CPU and never
-    # explicitly moved to TPU.  If left on CPU, JAX materialises them all
-    # on a SINGLE device core during optimizer.init(), filling 16 GB HBM
-    # immediately.  Replicate them to all devices now so each core holds
-    # only its fair share and sharding is established before bf16 cast.
-    _replicate_cpu_params(model, ctx)
-    print("[sharding] CPU params replicated to mesh")
+    # ── 7. Cast remaining CPU params to bf16, replicate to mesh ──────────
+    # W_Q, PartA, PartB, assembly weights are still on CPU (f32).
+    # Cast them to bf16 ON CPU (cheap — host RAM is plentiful), then
+    # device_put to ctx.replicated.  Pool/W_K are already on device in
+    # bf16 and are skipped (device check).
+    param_state = nnx.state(model, nnx.Param)
 
-    # ── 8. Cast all trainable params to bf16 ─────────────────────────────
-    # After step 7 all params are on correct devices; astype preserves
-    # their sharding.  bf16 halves model + optimizer memory (~6 GB/core).
-    cast_params_bf16(model)
-    print("[sharding] params cast to bf16 — optimizer state will be bf16")
+    def _cast_cpu_and_put(x):
+        if not hasattr(x, 'devices'):
+            return x
+        devs = list(x.devices())
+        if devs and devs[0].platform == 'cpu':
+            # Cast f32 → bf16 on CPU, then put on all mesh devices
+            return jax.device_put(x.astype(jnp.bfloat16), ctx.replicated)
+        # Already on TPU device (pool, W_K) — already bf16, leave as-is
+        return x
+
+    device_state = jax.tree_util.tree_map(_cast_cpu_and_put, param_state)
+    del param_state
+    gc.collect()
+    nnx.update(model, device_state)
+    del device_state
+    gc.collect()
+    print("[sharding] CPU params cast bf16 + replicated to mesh")
+    print("[sharding] All params now on device in bf16 — optimizer state will be bf16")
     return model
 
 
