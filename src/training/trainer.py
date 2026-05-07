@@ -146,14 +146,35 @@ def make_optimizer(model: nnx.Module, config, mesh=None) -> nnx.Optimizer:
     #
     # We then build the nnx.Optimizer normally and overwrite its internal
     # opt_state with the JIT-initialised (properly sharded) version.
+    # Extract raw JAX arrays from nnx.State before passing to optax.
+    # nnx.state() returns an nnx.State pytree whose leaves are nnx.Variable
+    # wrappers, not raw jax.Arrays. optax's tx.init calls jnp.zeros_like on
+    # each leaf; if the leaf is a Variable wrapper rather than a JAX array,
+    # zeros_like produces a CPU scalar and sharding info is lost entirely.
     param_state = nnx.state(model, nnx.Param)
+    raw_params = jax.tree_util.tree_map(
+        lambda v: v.value if hasattr(v, 'value') else v,
+        param_state,
+    )
+
+    # ── Wrap _jit_init in `with mesh:` ────────────────────────────────────
+    # CRITICAL: bare @jax.jit does NOT activate the mesh context.
+    # Without `with mesh:`, XLA's GSPMD sharding-propagation pass never runs,
+    # so zeros_like for the Adam mu/nu buffers falls back to the default
+    # device (core 0), materialising ~4 GB of optimizer state on one 16 GB
+    # core and triggering RESOURCE_EXHAUSTED.
+    # With `with mesh:`, GSPMD sees the NamedSharding on raw_params and
+    # propagates it to the zeros_like outputs, distributing mu/nu correctly.
+    import gc
 
     @jax.jit
     def _jit_init(params):
         return tx.init(params)
 
-    opt_state_raw = _jit_init(param_state)
-    import gc; gc.collect()
+    with mesh:
+        opt_state_raw = _jit_init(raw_params)
+    del raw_params
+    gc.collect()
     print("[optimizer] JIT-compiled tx.init complete — opt state sharded across mesh")
 
     # ── Bypass nnx.Optimizer.__init__ to avoid a second eager tx.init call ───
