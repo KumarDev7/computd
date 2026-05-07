@@ -36,6 +36,8 @@ try:
 except ImportError:
     _HAS_SHARD_MAP = False
 
+from src.model.dwa import DWAModel
+
 
 # ── Mesh creation ──────────────────────────────────────────────────────────
 
@@ -81,6 +83,83 @@ def shard_initial_state(model, ctx: MeshContext) -> None:
     """
     model.pool.vectors.value   = jax.device_put(model.pool.vectors.value,   ctx.pool_vecs)
     model.pool.ema_usage.value = jax.device_put(model.pool.ema_usage.value, ctx.pool_ema)
+
+
+# ── CPU-init + sharded push ───────────────────────────────────────────────
+
+def init_model_cpu_sharded(cfg, ctx: MeshContext, seed: int = 0) -> "DWAModel":
+    """
+    Initialize the full model in CPU RAM, then push sharded slices to TPU cores.
+
+    Why:  DWAModel.__init__ on a single TPU core OOMs at 7B — pool alone is
+          ~8.6 GB f32, and one v5e core has only 16 GB HBM.
+
+    How:
+      1. Init entire model on CPU (all params in host DRAM, zero TPU usage).
+      2. Extract pool numpy arrays — pool (N, D) + EMA (N,).
+      3. Split along the N axis into pool_size equal slices.
+      4. jax.device_put each slice to its target TPU core.
+      5. Reassemble into global sharded JAX arrays via
+         jax.make_array_from_single_device_arrays.
+      6. Non-pool params stay on CPU refs; XLA replicates them on first JIT.
+
+    At 7B (N=32768, D=69632, pool_size=4):
+      CPU RAM peak:  pool 8.6 GB + other params ~2 GB  ≈ 11 GB  (host has 200 GB+)
+      Per-TPU-core:  pool shard 2.1 GB + other replicated params ~2 GB  ≈ 4 GB
+    """
+    cpu = jax.devices('cpu')[0]
+
+    # ── 1. Full init on CPU ───────────────────────────────────────────────
+    with jax.default_device(cpu):
+        model = DWAModel(cfg, nnx.Rngs(seed))
+
+    # ── 2. Extract pool arrays into numpy (host RAM, no device copy) ──────
+    pool_np = np.array(model.pool.vectors.value)    # (N, D)
+    ema_np  = np.array(model.pool.ema_usage.value)  # (N,)
+
+    N, D          = pool_np.shape
+    data_size     = ctx.data_size
+    pool_size     = ctx.pool_size
+    N_per_shard   = N // pool_size
+    assert N % pool_size == 0, (
+        f"N={N} must be divisible by pool_size={pool_size}"
+    )
+
+    # ── 3 & 4. Split in numpy, push each slice to its device ─────────────
+    # NamedSharding P('pool', None):
+    #   pool axis index j → rows [j*N_per_shard : (j+1)*N_per_shard]
+    #   data axis index i → same slice replicated on mesh.devices[i, j]
+    pool_device_arrays = []
+    ema_device_arrays  = []
+    for j in range(pool_size):
+        pool_shard = pool_np[j * N_per_shard : (j + 1) * N_per_shard]  # (N/pool, D)
+        ema_shard  = ema_np[ j * N_per_shard : (j + 1) * N_per_shard]  # (N/pool,)
+        for i in range(data_size):
+            device = ctx.mesh.devices[i, j]
+            pool_device_arrays.append(jax.device_put(pool_shard, device))
+            ema_device_arrays.append(jax.device_put(ema_shard,  device))
+
+    # ── 5. Assemble global sharded arrays ─────────────────────────────────
+    # make_array_from_single_device_arrays owns the per-device buffers —
+    # no extra copies, no all-gather needed.
+    model.pool.vectors.value = jax.make_array_from_single_device_arrays(
+        shape=(N, D),
+        sharding=ctx.pool_vecs,
+        arrays=pool_device_arrays,
+    )
+    model.pool.ema_usage.value = jax.make_array_from_single_device_arrays(
+        shape=(N,),
+        sharding=ctx.pool_ema,
+        arrays=ema_device_arrays,
+    )
+
+    print(
+        f"[sharding] pool sharded: {pool_size} shards × "
+        f"{N_per_shard}×{D} "
+        f"({pool_np.nbytes / 2**30:.2f} GB total → "
+        f"{pool_shard.nbytes / 2**30:.2f} GB/core)"  # type: ignore[possibly-undefined]
+    )
+    return model
 
 
 # ── Pool-parallel hybrid retrieval ────────────────────────────────────────

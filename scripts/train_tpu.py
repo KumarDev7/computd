@@ -89,12 +89,16 @@ def main():
     from src.model.dwa import DWAModel
     from src.training.trainer import make_optimizer
 
-    model = DWAModel(cfg, nnx.Rngs(0))
-    opt   = make_optimizer(model, cfg)
-
     if use_pool_parallel:
-        shard_initial_state(model, ctx)
-        print("[train_tpu] pool vectors sharded across pool axis")
+        from src.training.sharding import init_model_cpu_sharded
+        # Init in CPU RAM → split N axis → push each slice to its TPU core.
+        # Never puts the full pool on a single device — no OOM at 7B.
+        model = init_model_cpu_sharded(cfg, ctx, seed=0)
+        print("[train_tpu] model init: CPU RAM → sharded TPU push complete")
+    else:
+        model = DWAModel(cfg, nnx.Rngs(0))
+
+    opt = make_optimizer(model, cfg)
 
     # ── Data ─────────────────────────────────────────────────────────────
     from src.data.text_loader import shakespeare_loader
