@@ -70,6 +70,11 @@ class MeshContext:
         self.pool_ema   = NamedSharding(mesh, P('pool',))        # (N,)  → N sharded
         self.batch      = NamedSharding(mesh, P('data', None))   # (B, T) → B sharded
         self.replicated = NamedSharding(mesh, P())
+        # W_K: (S, d_k, D) → D sharded across pool axis.
+        # Aligns with pool vectors (N, D): the D contraction in
+        # einsum('skd,nd→snk') becomes a local partial product + psum.
+        # At 7B: 16×128×69632 × 2B = 286 MB/block → 71 MB/core (pool=4).
+        self.w_k_sharding = NamedSharding(mesh, P(None, None, 'pool'))
 
 
 # ── Initial state sharding ─────────────────────────────────────────────────
@@ -79,10 +84,17 @@ def shard_initial_state(model, ctx: MeshContext) -> None:
     Move model parameters to their correct shards. Call once after model init.
 
     Pool vectors + EMA → pool axis (N sharded).
+    W_K per block      → pool axis (D sharded).
     All other params   → replicated (default JAX behaviour for single-device init).
     """
     model.pool.vectors.value   = jax.device_put(model.pool.vectors.value,   ctx.pool_vecs)
     model.pool.ema_usage.value = jax.device_put(model.pool.ema_usage.value, ctx.pool_ema)
+
+    # Shard W_K (S, d_k, D) along D across pool axis — matches pool D dimension
+    for block in model.blocks:
+        block.retrieval.W_K.value = jax.device_put(
+            block.retrieval.W_K.value, ctx.w_k_sharding
+        )
 
 
 # ── CPU-init + sharded push ───────────────────────────────────────────────
@@ -106,6 +118,7 @@ def init_model_cpu_sharded(cfg, ctx: MeshContext, seed: int = 0) -> "DWAModel":
     At 7B (N=32768, D=69632, pool_size=4):
       CPU RAM peak:  pool 8.6 GB + other params ~2 GB  ≈ 11 GB  (host has 200 GB+)
       Per-TPU-core:  pool shard 2.1 GB + other replicated params ~2 GB  ≈ 4 GB
+                     W_K shards: 71 MB/core (vs 286 MB replicated) × 18 blocks
     """
     cpu = jax.devices('cpu')[0]
 
@@ -121,8 +134,12 @@ def init_model_cpu_sharded(cfg, ctx: MeshContext, seed: int = 0) -> "DWAModel":
     data_size     = ctx.data_size
     pool_size     = ctx.pool_size
     N_per_shard   = N // pool_size
+    D_per_shard   = D // pool_size
     assert N % pool_size == 0, (
         f"N={N} must be divisible by pool_size={pool_size}"
+    )
+    assert D % pool_size == 0, (
+        f"D={D} must be divisible by pool_size={pool_size} for W_K sharding"
     )
 
     # ── 3 & 4. Split in numpy, push each slice to its device ─────────────
@@ -159,6 +176,38 @@ def init_model_cpu_sharded(cfg, ctx: MeshContext, seed: int = 0) -> "DWAModel":
         f"({pool_np.nbytes / 2**30:.2f} GB total → "
         f"{pool_shard.nbytes / 2**30:.2f} GB/core)"  # type: ignore[possibly-undefined]
     )
+
+    # ── 6. Shard W_K (S, d_k, D) along D axis across pool shards ─────────
+    # Each pool shard j gets W_K[:, :, j*D_per_shard : (j+1)*D_per_shard].
+    # The local key GEMM einsum('skd,nd→snk') with local pool_vecs produces
+    # partial dot products; psum across 'pool' yields the correct full result.
+    wk_total_bytes = 0
+    for block_i, block in enumerate(model.blocks):
+        wk_np = np.array(block.retrieval.W_K.value)  # (S, d_k, D)
+        S_wk, dk_wk, D_wk = wk_np.shape
+        assert D_wk == D, f"Block {block_i}: W_K D={D_wk} != pool D={D}"
+
+        wk_device_arrays = []
+        for j in range(pool_size):
+            wk_shard = wk_np[:, :, j * D_per_shard : (j + 1) * D_per_shard]  # (S, d_k, D/pool)
+            for i in range(data_size):
+                device = ctx.mesh.devices[i, j]
+                wk_device_arrays.append(jax.device_put(wk_shard, device))
+
+        block.retrieval.W_K.value = jax.make_array_from_single_device_arrays(
+            shape=(S_wk, dk_wk, D_wk),
+            sharding=ctx.w_k_sharding,
+            arrays=wk_device_arrays,
+        )
+        wk_total_bytes += wk_np.nbytes
+
+    wk_per_core = wk_total_bytes / pool_size
+    print(
+        f"[sharding] W_K sharded: {len(model.blocks)} blocks × "
+        f"({S_wk}×{dk_wk}×{D_per_shard})/core "
+        f"({wk_total_bytes / 2**20:.1f} MB total → "
+        f"{wk_per_core / 2**20:.1f} MB/core)"
+    )
     return model
 
 
@@ -188,7 +237,7 @@ def make_pool_parallel_retrieve(ctx: MeshContext, k_max: int, T: float):
         in_specs=(
             P('data', None, None),   # z:             (B/data, T, d_A)
             P('pool', None),          # pool_vecs:     (N/pool, D)
-            P(None, None, None),      # W_K:           (S, d_k, D) — replicated
+            P(None, None, 'pool'),    # W_K:           (S, d_k, D/pool) — D sharded
             P(None, None, None),      # W_Q:           (S, d_k, d_A) — replicated
             P(None),                  # aspect_logits: (S,) — replicated
             P(None),                  # tau:           (S,) — replicated
@@ -207,13 +256,34 @@ def make_pool_parallel_retrieve(ctx: MeshContext, k_max: int, T: float):
         """
         Each program instance handles (B/data, T, N/pool) locally, then
         merges top-k across the pool axis via all_gather + top_k.
+
+        W_K is sharded along D: each shard holds (S, d_k, D/pool).
+        The key GEMM produces partial dot products; psum across 'pool'
+        yields the correct full key vectors before normalization.
         """
         N_local   = pool_vecs.shape[0]
         pool_rank = lax.axis_index('pool')           # 0 … pool_size-1
         B_local, T, d_A = z.shape
 
         # ── Local keys for this pool shard ──────────────────────────────
-        local_keys = jnp.einsum('skd,nd->snk', W_K, pool_vecs)   # (S, N/pool, d_k)
+        # W_K is (S, d_k, D/pool), pool_vecs is (N/pool, D) but D is full
+        # within each pool shard (pool shards N, not D for pool_vecs).
+        # However W_K's D IS sharded — so the einsum produces partial sums
+        # over the D contraction. psum across 'pool' completes the reduction.
+        #
+        # Note: pool_vecs here is (N_local, D_full) because pool shards along N.
+        # W_K here is (S, d_k, D_local) because W_K shards along D.
+        # We need the full D contraction: key_i = Σ_d W_K[s,k,d] * pool[n,d]
+        # With D split across pool shards: local_partial = W_K_local @ pool_local_d
+        # But pool_vecs has full D on each shard (N is sharded, not D).
+        # So we slice pool_vecs' D to match W_K's local D shard.
+        D_local = W_K.shape[2]  # D / pool_size
+        pool_vecs_d_local = lax.dynamic_slice_in_dim(
+            pool_vecs, pool_rank * D_local, D_local, axis=1
+        )  # (N_local, D_local)
+        local_keys_partial = jnp.einsum('skd,nd->snk', W_K, pool_vecs_d_local)  # (S, N/pool, d_k)
+        # All-reduce partial products across pool axis to get full key vectors
+        local_keys = lax.psum(local_keys_partial, axis_name='pool')  # (S, N/pool, d_k)
         local_keys = local_keys / (jnp.linalg.norm(local_keys, axis=-1, keepdims=True) + 1e-8)
 
         # ── Per-position queries ─────────────────────────────────────────
@@ -225,34 +295,57 @@ def make_pool_parallel_retrieve(ctx: MeshContext, k_max: int, T: float):
         w            = jax.nn.softmax(aspect_logits)
         local_sims   = jnp.einsum('s,sbtn->btn', w, local_sims_s)  # (B/data, T, N/pool)
 
-        # ── All-gather across pool axis → full (B/data, T, N) ───────────
-        # all_gather axis=0 prepends a pool-size leading dim
-        all_sims = lax.all_gather(local_sims, axis_name='pool', axis=0, tiled=False)
-        # all_sims: (pool, B/data, T, N/pool) → (B/data, T, N)
-        sims_full = all_sims.transpose(1, 2, 0, 3).reshape(B_local, T, pool_size * N_local)
+        # ── Streaming top-k: never materialize (B, T, N) in HBM ─────────
+        # Instead of all_gathering the full (B,T,N) sims tensor (0.5 GB at 7B),
+        # apply sigmoid gate + top_k LOCALLY per pool shard, then all_gather
+        # only the tiny (pool, B, T, k_max) top-k results and merge.
+        #
+        # Memory: (B,T,N/pool) local sims + (B,T,k_max) local top-k
+        #         vs. (B,T,N) full sims — saves pool_size × reduction.
 
-        # ── Sigmoid gate + alpha_raw over full N ────────────────────────
-        tau_scalar  = jnp.dot(w, tau)
-        gate        = jax.nn.sigmoid(lambda_sharp * (sims_full - tau_scalar))
-        alpha_raw   = gate * jnp.exp(sims_full / T)               # (B/data, T, N)
+        tau_scalar    = jnp.dot(w, tau)
+        local_gate    = jax.nn.sigmoid(lambda_sharp * (local_sims - tau_scalar))
+        local_ar      = local_gate * jnp.exp(local_sims / T)      # (B/data, T, N/pool)
 
-        # ── Global top-k ─────────────────────────────────────────────────
-        top_vals, top_idx = jax.lax.top_k(alpha_raw, k_max)       # (B/data, T, k_max)
-        alpha = top_vals / (jnp.sum(top_vals, axis=-1, keepdims=True) + 1e-8)
+        # Local top-k on this pool shard
+        local_top_vals, local_top_sel = jax.lax.top_k(local_ar, k_max)  # (B/data, T, k_max)
+        # Convert local indices to global N-indices
+        pool_start      = pool_rank * N_local
+        local_top_idx   = local_top_sel + pool_start               # (B/data, T, k_max)
+
+        # ── All-gather local top-k across pool shards ────────────────────
+        # Only communicates (pool, B/data, T, k_max) — tiny vs (B,T,N).
+        # At 7B: 4 × 4 × 2048 × 32 × 4B = 4 MB vs 0.5 GB for full sims.
+        all_top_vals = lax.all_gather(local_top_vals, axis_name='pool', axis=0, tiled=False)
+        all_top_idx  = lax.all_gather(local_top_idx,  axis_name='pool', axis=0, tiled=False)
+        # (pool, B/data, T, k_max) → merge into (B/data, T, pool*k_max)
+        merged_vals = all_top_vals.transpose(1, 2, 0, 3).reshape(B_local, T, pool_size * k_max)
+        merged_idx  = all_top_idx.transpose(1, 2, 0, 3).reshape(B_local, T, pool_size * k_max)
+
+        # ── Global top-k from merged candidates ──────────────────────────
+        # pool_size * k_max candidates per position (e.g., 4*32=128) → keep k_max.
+        top_vals, sel = jax.lax.top_k(merged_vals, k_max)         # (B/data, T, k_max)
+        top_idx  = jnp.take_along_axis(merged_idx, sel, axis=-1)  # (B/data, T, k_max)
+        alpha    = top_vals / (jnp.sum(top_vals, axis=-1, keepdims=True) + 1e-8)
 
         # ── Distributed gather of pool vectors ────────────────────────────
         # Each shard contributes its local slice; masked-psum merges all shards.
         # Cost per step: k_max * D floats communicated — tiny even at 7B.
-        pool_start    = pool_rank * N_local
         in_shard      = (top_idx >= pool_start) & (top_idx < pool_start + N_local)
         local_idx     = jnp.where(in_shard, top_idx - pool_start, 0)
         local_vecs    = pool_vecs[local_idx]                        # (B/data, T, k_max, D)
         local_vecs    = jnp.where(in_shard[..., None], local_vecs, 0.0)
         gathered_vecs = lax.psum(local_vecs, axis_name='pool')     # (B/data, T, k_max, D)
 
-        # ── Seq-mean aux tensors ──────────────────────────────────────────
-        sims_seq      = sims_full.mean(axis=1)                     # (B/data, N)
-        alpha_raw_seq = alpha_raw.mean(axis=1)                     # (B/data, N)
+        # ── Seq-mean aux tensors (avoid (B,T,N) materialization) ──────────
+        # Reduce local sims to (B, N/pool) first, then all_gather to (B, N).
+        local_sims_seq = local_sims.mean(axis=1)                   # (B/data, N/pool)
+        local_ar_seq   = local_ar.mean(axis=1)                     # (B/data, N/pool)
+        all_sims_seq   = lax.all_gather(local_sims_seq, axis_name='pool', axis=0, tiled=False)
+        all_ar_seq     = lax.all_gather(local_ar_seq,   axis_name='pool', axis=0, tiled=False)
+        # (pool, B/data, N/pool) → (B/data, N)
+        sims_seq       = all_sims_seq.transpose(1, 0, 2).reshape(B_local, pool_size * N_local)
+        alpha_raw_seq  = all_ar_seq.transpose(1, 0, 2).reshape(B_local, pool_size * N_local)
 
         return alpha, top_idx, sims_seq, alpha_raw_seq, gathered_vecs
 
@@ -313,7 +406,7 @@ def make_sharded_train_step(model, optimizer, cfg, ctx: MeshContext):
         in_specs=(
             P('data', None),           # batch:          (B/data, T)
             P('pool', None),           # pool_vecs:      (N/pool, D)
-            P(None, None, None),       # W_K:            (S, d_k, D)
+            P(None, None, 'pool'),     # W_K:            (S, d_k, D/pool) — D sharded
             P(None, None, None),       # W_Q:            (S, d_k, d_A)
             P(None),                   # aspect_logits:  (S,)
             P(None),                   # tau:            (S,)
@@ -336,6 +429,7 @@ def make_sharded_train_step(model, optimizer, cfg, ctx: MeshContext):
         """
         Full forward pass + cross-entropy loss for one (data, pool) shard.
         Loss is pmean'd across data axis so autodiff gives correct all-reduce.
+        W_K is D-sharded: local partial key GEMM + psum = full keys.
         """
         x       = batch[:, :-1]    # (B/data, T-1)
         targets = batch[:, 1:]     # (B/data, T-1)
@@ -344,8 +438,14 @@ def make_sharded_train_step(model, optimizer, cfg, ctx: MeshContext):
         N_local   = pool_vecs.shape[0]
         pool_rank = lax.axis_index('pool')
 
-        # ── Pool-parallel retrieval ──────────────────────────────────────
-        local_keys = jnp.einsum('skd,nd->snk', W_K, pool_vecs)
+        # ── Pool-parallel retrieval (W_K D-sharded) ─────────────────────
+        # W_K is (S, d_k, D/pool) — slice pool_vecs D to match, then psum.
+        D_local = W_K.shape[2]
+        pool_vecs_d_local = lax.dynamic_slice_in_dim(
+            pool_vecs, pool_rank * D_local, D_local, axis=1
+        )  # (N_local, D_local)
+        local_keys_partial = jnp.einsum('skd,nd->snk', W_K, pool_vecs_d_local)
+        local_keys = lax.psum(local_keys_partial, axis_name='pool')
         local_keys = local_keys / (jnp.linalg.norm(local_keys, axis=-1, keepdims=True) + 1e-8)
 
         # Minimal PartA proxy: linear projection of x_oh (model.part_a is complex;
@@ -382,8 +482,11 @@ def make_sharded_train_step(model, optimizer, cfg, ctx: MeshContext):
             automatically all-reduced by XLA autodiff
 
         Gradient routing:
-          Replicated params (W_Q, W_K, assembly, PartA/B):
+          Replicated params (W_Q, assembly, PartA/B):
             grad = lax.psum(local_grad, 'data') via autodiff of pmean
+          W_K params (D-sharded P(None, None, 'pool')):
+            grad of psum in key GEMM → each shard gets grad for its D/pool slice
+            + data-axis all-reduce via autodiff of loss pmean
           Pool params (sharded P('pool', None)):
             grad routed to correct shard via masked-psum in pool_retrieve
         """

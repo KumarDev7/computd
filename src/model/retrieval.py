@@ -3,6 +3,7 @@ import jax.numpy as jnp
 from flax import nnx
 
 from src.kernels.fused_retrieval import fused_weighted_similarity
+from src.kernels.fused_topk_retrieval import fused_topk_retrieval
 
 
 class MultiAspectRetrieval(nnx.Module):
@@ -128,9 +129,12 @@ class MultiAspectRetrieval(nnx.Module):
         Hybrid retrieval: compute ALL N dot products (GEMM-saturated, like soft)
         but keep only top-k for assembly (memory-efficient, like hard).
 
-        TPU-optimal: the full similarity GEMM saturates the MXU, then top_k
-        immediately discards the (B, seq, N) intermediate — only (B, seq, k_max)
-        is materialized for assembly and backprop.
+        Fused kernel: GEMM + sigmoid gate + streaming top-k in one pass.
+        Never materializes (B, seq, N) in HBM — only (B*T, tile_n) lives
+        in VMEM/register at any moment, with a running (B*T, k_max) heap.
+
+        At 7B (B=8, T=2048, N=32768): saves ~1.5 GB HBM per layer vs
+        the old separate GEMM → gate → top_k pipeline.
 
         Returns:
           alpha:         (batch, seq, k_max) — top-k weights (tiny, same as hard)
@@ -146,24 +150,32 @@ class MultiAspectRetrieval(nnx.Module):
         queries = jnp.einsum('skd,btd->sbtk', self.W_Q.value, z)
         queries = queries / (jnp.linalg.norm(queries, axis=-1, keepdims=True) + 1e-8)
 
-        # Fused: Σ_s w[s]*Q[s]@K[s].T → (batch, seq, N) without (S,B,T,N) peak.
-        # TPU: Pallas Mosaic kernel (tiles in VMEM).  GPU/CPU: per-aspect loop.
-        w      = jax.nn.softmax(self.aspect_logits.value)
-        sims_w = fused_weighted_similarity(queries, keys, w)       # (batch, seq, N)
+        # Aspect weights
+        w = jax.nn.softmax(self.aspect_logits.value)
 
         if use_sigmoid:
-            tau       = jnp.dot(w, self.tau.value)
-            gate      = jax.nn.sigmoid(lambda_sharp * (sims_w - tau))
-            alpha_raw = gate * jnp.exp(sims_w / T)
+            tau_scalar = jnp.dot(w, self.tau.value)
+
+            # Fused GEMM + sigmoid gate + streaming top-k:
+            # Never materializes (B, seq, N) in HBM.
+            top_vals, top_idx, sims_seq, alpha_raw_seq = fused_topk_retrieval(
+                queries, keys, w,
+                k_max=k_max,
+                lambda_sharp=lambda_sharp,
+                tau_scalar=tau_scalar,
+                T=T,
+            )
+            alpha = top_vals / (jnp.sum(top_vals, axis=-1, keepdims=True) + 1e-8)
+            return alpha, top_idx, sims_seq, alpha_raw_seq
         else:
+            # Non-sigmoid path: use the existing fused GEMM (still avoids (S,B,T,N))
+            # then apply exp + top_k.  This path is only phase-1 warmup.
+            sims_w = fused_weighted_similarity(queries, keys, w)  # (batch, seq, N)
             alpha_raw = jnp.exp(sims_w / T)
 
-        # Top-k: full GEMM computed, but only keep k_max per position
-        top_vals, top_idx = jax.lax.top_k(alpha_raw, k_max)       # (batch, seq, k_max)
-        alpha = top_vals / (jnp.sum(top_vals, axis=-1, keepdims=True) + 1e-8)
-
-        # Collapse seq dim for aux-loss compatibility
-        return alpha, top_idx, sims_w.mean(axis=1), alpha_raw.mean(axis=1)
+            top_vals, top_idx = jax.lax.top_k(alpha_raw, k_max)
+            alpha = top_vals / (jnp.sum(top_vals, axis=-1, keepdims=True) + 1e-8)
+            return alpha, top_idx, sims_w.mean(axis=1), alpha_raw.mean(axis=1)
 
     def per_position_alpha(
         self,
