@@ -115,11 +115,13 @@ def main():
 
     # ── Train step selection ──────────────────────────────────────────────
     if use_pool_parallel:
-        from src.training.sharding import make_sharded_train_step
-        train_step = make_sharded_train_step(model, opt, cfg, ctx)
+        from src.training.sharding import make_sharded_train_step, shard_batch
+        train_step   = make_sharded_train_step(model, opt, cfg, ctx)
+        _shard_batch = lambda b: shard_batch(b, ctx)
         print("[train_tpu] using pool-parallel sharded train step")
     else:
         from src.training.trainer import train_step
+        _shard_batch = lambda b: b   # no-op
         print("[train_tpu] using standard nnx.jit train step")
 
     # ── Training loop ─────────────────────────────────────────────────────
@@ -142,7 +144,8 @@ def main():
             rotator = Phase1Rotator(cfg.N, batch.shape[0], cfg.k_max, seed=0)
         forced_idx = rotator.dummy()
 
-        t0 = time.time()
+        t0    = time.time()
+        batch = _shard_batch(batch)   # split across data axis, push to TPU cores
         metrics = train_step(
             model, opt, batch,
             use_sigmoid, False, lambda_sharp, lambda_entropy_eff, forced_idx, True,
