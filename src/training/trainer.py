@@ -108,10 +108,16 @@ def make_optimizer(model: nnx.Module, config) -> nnx.Optimizer:
 
     tx = optax.multi_transform(
         {
-            "pool":      optax.adamw(config.lr_pool,          weight_decay=1e-4),
-            "parts":     optax.adamw(config.lr_parts,         weight_decay=1e-4),
-            "retrieval": optax.adamw(config.lr_retrieval,     weight_decay=1e-4),
-            "threshold": optax.adam(config.lr_threshold_gamma),
+            # mu_dtype=bf16 halves first-moment storage.  At 7B this saves
+            # ~3 GB/core of optimizer state — critical for fitting in v5e HBM.
+            "pool":      optax.adamw(config.lr_pool,          weight_decay=1e-4,
+                                     mu_dtype=jnp.bfloat16),
+            "parts":     optax.adamw(config.lr_parts,         weight_decay=1e-4,
+                                     mu_dtype=jnp.bfloat16),
+            "retrieval": optax.adamw(config.lr_retrieval,     weight_decay=1e-4,
+                                     mu_dtype=jnp.bfloat16),
+            "threshold": optax.adam(config.lr_threshold_gamma,
+                                    mu_dtype=jnp.bfloat16),
         },
         param_labels=label_fn,
     )
