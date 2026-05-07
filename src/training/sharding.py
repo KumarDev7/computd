@@ -23,6 +23,7 @@ Gradient flow:
 """
 
 import functools
+import gc
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -84,9 +85,9 @@ def cast_params_bf16(model) -> None:
     Cast all nnx.Param tensors to bfloat16 in-place, preserving sharding.
 
     Why bfloat16 params:
-      - Halves model memory (f32 \u2192 bf16) \u2014 saves ~3 GB/core at 7B
-      - Optimizer state (mu + nu) is zeros_like(params) \u2192 also bf16
-        \u2192 total optimizer memory halved, freeing ~6 GB/core at 7B scale
+      - Halves model memory (f32 → bf16) — saves ~3 GB/core at 7B
+      - Optimizer state (mu + nu) is zeros_like(params) → also bf16
+        → total optimizer memory halved, freeing ~6 GB/core at 7B scale
       - TPU MXU natively operates in bf16; no compute cost
       - Numerically safe: bf16 has same exponent range as f32
 
@@ -104,7 +105,49 @@ def cast_params_bf16(model) -> None:
         ) else x,
         param_state,
     )
+    # Explicitly free f32 state before writing bf16 back.
+    # Without del + gc, param_state keeps f32 arrays alive until
+    # after nnx.update, preventing timely HBM release.
+    del param_state
+    gc.collect()
     nnx.update(model, bf16_state)
+    del bf16_state
+    gc.collect()
+
+
+def _replicate_cpu_params(model, ctx: "MeshContext") -> None:
+    """
+    Move any nnx.Param still on CPU to ctx.replicated (all TPU devices).
+
+    init_model_cpu_sharded only explicitly pushes pool and W_K to TPU.
+    All other params (W_Q, PartA, PartB, assembly weights) remain in CPU
+    RAM.  If they are NOT moved before optimizer init, JAX materialises
+    them all onto whichever single device it picks — filling that core's
+    16 GB HBM before any optimizer state is even allocated.
+
+    This function walks every nnx.Param, identifies CPU-resident arrays
+    (device platform == 'cpu'), and puts them on ctx.replicated so they
+    are spread evenly across the whole mesh before optimizer.init().
+    Already-sharded arrays (pool, W_K) are left untouched.
+    """
+    cpu_platform = 'cpu'
+
+    param_state = nnx.state(model, nnx.Param)
+
+    def _move_if_cpu(x):
+        if not hasattr(x, 'devices'):
+            return x
+        devs = list(x.devices())
+        if devs and devs[0].platform == cpu_platform:
+            return jax.device_put(x, ctx.replicated)
+        return x
+
+    device_state = jax.tree_util.tree_map(_move_if_cpu, param_state)
+    del param_state
+    gc.collect()
+    nnx.update(model, device_state)
+    del device_state
+    gc.collect()
 
 
 # ── Initial state sharding ─────────────────────────────────────────────────
@@ -239,9 +282,18 @@ def init_model_cpu_sharded(cfg, ctx: MeshContext, seed: int = 0) -> "DWAModel":
         f"{wk_per_core / 2**20:.1f} MB/core)"
     )
 
-    # ── 7. Cast all trainable params to bf16 ─────────────────────────────
-    # Must happen AFTER sharding so per-tensor shard specs are preserved.
-    # This halves optimizer state (mu+nu) from f32 to bf16 — ~6 GB saved/core.
+    # ── 7. Replicate CPU-resident params to the full mesh ────────────────────
+    # W_Q, PartA, PartB, assembly weights were init'd on CPU and never
+    # explicitly moved to TPU.  If left on CPU, JAX materialises them all
+    # on a SINGLE device core during optimizer.init(), filling 16 GB HBM
+    # immediately.  Replicate them to all devices now so each core holds
+    # only its fair share and sharding is established before bf16 cast.
+    _replicate_cpu_params(model, ctx)
+    print("[sharding] CPU params replicated to mesh")
+
+    # ── 8. Cast all trainable params to bf16 ─────────────────────────────
+    # After step 7 all params are on correct devices; astype preserves
+    # their sharding.  bf16 halves model + optimizer memory (~6 GB/core).
     cast_params_bf16(model)
     print("[sharding] params cast to bf16 — optimizer state will be bf16")
     return model
