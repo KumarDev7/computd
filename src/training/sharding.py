@@ -38,6 +38,7 @@ except ImportError:
     _HAS_SHARD_MAP = False
 
 from src.model.dwa import DWAModel
+from src.model.assembly import partial_uv_einsum
 
 
 # ── Mesh creation ──────────────────────────────────────────────────────────
@@ -416,12 +417,17 @@ def _shard_tensor_parallel(model, ctx: "MeshContext") -> None:
 
 # ── Pool-parallel hybrid retrieval ────────────────────────────────────────
 
-def make_pool_parallel_retrieve(ctx: MeshContext, k_max: int, T: float):
+def make_pool_parallel_retrieve(ctx: MeshContext, k_max: int, T: float,
+                                 d_B: int, r: int, d_A: int):
     """
-    Returns a pool-parallel retrieval function built for the given mesh.
+    Returns a (pool_retrieve, assemble_sharded) pair.
 
-    The returned function has the same signature as retrieval_module.hybrid_forward
-    but uses shard_map to distribute the N-wide GEMM across pool shards.
+    pool_retrieve   — shard_map that does top-k retrieval in parallel.
+    assemble_sharded — shard_map that gathers D_local-shard vectors,
+                       computes partial U@V einsum, psums (B,T,d_B) result.
+
+    Separating the two allows _sharded_step to pass h_A, W_base, b_base to
+    assemble_sharded without bloating pool_retrieve's in_specs.
 
     Requires JAX 0.4.14+ for shard_map.
     """
@@ -434,6 +440,24 @@ def make_pool_parallel_retrieve(ctx: MeshContext, k_max: int, T: float):
     pool_size = ctx.pool_size
     mesh      = ctx.mesh
 
+    # ── Static offset math (Python ints → XLA compile-time constants) ───
+    # Full vector layout: [U (d_B*r) | V (r*d_A) | b (d_B)]
+    g_off_V = d_B * r
+    g_off_b = d_B * r + r * d_A
+    g_end_b = g_off_b + d_B
+    D_total = g_end_b                   # == D from config
+    D_local_static = D_total // pool_size
+
+    # Per-shard offsets for U/V/b decomposition (one entry per pool shard)
+    shard_offsets = []
+    for shard_rank in range(pool_size):
+        g_start = shard_rank * D_local_static
+        off_V = max(0, min(D_local_static, g_off_V - g_start))
+        off_b = max(0, min(D_local_static, g_off_b - g_start))
+        end_b = max(0, min(D_local_static, g_end_b - g_start))
+        shard_offsets.append((off_V, off_b, end_b))
+
+    # ── Retrieval shard_map ──────────────────────────────────────────────
     @functools.partial(
         shard_map,
         mesh=mesh,
@@ -447,11 +471,10 @@ def make_pool_parallel_retrieve(ctx: MeshContext, k_max: int, T: float):
             P(None),                  # lambda_sharp:  scalar
         ),
         out_specs=(
-            P('data', None, None),   # alpha:       (B/data, T, k_max)
-            P('data', None, None),   # top_idx:     (B/data, T, k_max)  global indices
-            P('data', None),         # sims_seq:    (B/data, N) — for aux losses
-            P('data', None),         # alpha_raw_seq:(B/data, N)
-            P('data', None, None, None),  # gathered_vecs: (B/data, T, k_max, D)
+            P('data', None, None),   # alpha:         (B/data, T, k_max)
+            P('data', None, None),   # top_idx:       (B/data, T, k_max) global indices
+            P('data', None),         # sims_seq:      (B/data, N) — for aux losses
+            P('data', None),         # alpha_raw_seq: (B/data, N)
         ),
         check_rep=False,
     )
@@ -466,59 +489,35 @@ def make_pool_parallel_retrieve(ctx: MeshContext, k_max: int, T: float):
         """
         N_local   = pool_vecs.shape[0]
         pool_rank = lax.axis_index('pool')           # 0 … pool_size-1
-        B_local, T, d_A = z.shape
+        B_local, T_local, _ = z.shape
 
-        # ── Local keys for this pool shard ──────────────────────────────
-        # W_K is (S, d_k, D/pool), pool_vecs is (N/pool, D) but D is full
-        # within each pool shard (pool shards N, not D for pool_vecs).
-        # However W_K's D IS sharded — so the einsum produces partial sums
-        # over the D contraction. psum across 'pool' completes the reduction.
-        #
-        # Note: pool_vecs here is (N_local, D_full) because pool shards along N.
-        # W_K here is (S, d_k, D_local) because W_K shards along D.
-        # We need the full D contraction: key_i = Σ_d W_K[s,k,d] * pool[n,d]
-        # With D split across pool shards: local_partial = W_K_local @ pool_local_d
-        # But pool_vecs has full D on each shard (N is sharded, not D).
-        # So we slice pool_vecs' D to match W_K's local D shard.
+        # ── Local keys ──────────────────────────────────────────────────
         D_local = W_K.shape[2]  # D / pool_size
         pool_vecs_d_local = lax.dynamic_slice_in_dim(
             pool_vecs, pool_rank * D_local, D_local, axis=1
         )  # (N_local, D_local)
-        local_keys_partial = jnp.einsum('skd,nd->snk', W_K, pool_vecs_d_local)  # (S, N/pool, d_k)
-        # All-reduce partial products across pool axis to get full key vectors
-        local_keys = lax.psum(local_keys_partial, axis_name='pool')  # (S, N/pool, d_k)
+        local_keys_partial = jnp.einsum('skd,nd->snk', W_K, pool_vecs_d_local)
+        local_keys = lax.psum(local_keys_partial, axis_name='pool')
         local_keys = local_keys / (jnp.linalg.norm(local_keys, axis=-1, keepdims=True) + 1e-8)
 
         # ── Per-position queries ─────────────────────────────────────────
-        queries = jnp.einsum('skd,btd->sbtk', W_Q, z)             # (S, B/data, T, d_k)
+        queries = jnp.einsum('skd,btd->sbtk', W_Q, z)
         queries = queries / (jnp.linalg.norm(queries, axis=-1, keepdims=True) + 1e-8)
 
-        # ── Local similarities: (S, B/data, T, N/pool) → (B/data, T, N/pool)
+        # ── Local similarities ───────────────────────────────────────────
         local_sims_s = jnp.einsum('sbtk,snk->sbtn', queries, local_keys)
         w            = jax.nn.softmax(aspect_logits)
-        local_sims   = jnp.einsum('s,sbtn->btn', w, local_sims_s)  # (B/data, T, N/pool)
-
-        # ── Streaming top-k: never materialize (B, T, N) in HBM ─────────
-        # Instead of all_gathering the full (B,T,N) sims tensor (0.5 GB at 7B),
-        # apply sigmoid gate + top_k LOCALLY per pool shard, then all_gather
-        # only the tiny (pool, B, T, k_max) top-k results and merge.
-        #
-        # Memory: (B,T,N/pool) local sims + (B,T,k_max) local top-k
-        #         vs. (B,T,N) full sims — saves pool_size × reduction.
+        local_sims   = jnp.einsum('s,sbtn->btn', w, local_sims_s)
 
         tau_scalar    = jnp.dot(w, tau)
         local_gate    = jax.nn.sigmoid(lambda_sharp * (local_sims - tau_scalar))
-        local_ar      = local_gate * jnp.exp(local_sims / T)      # (B/data, T, N/pool)
+        local_ar      = local_gate * jnp.exp(local_sims / T)
 
-        # Local top-k on this pool shard
-        local_top_vals, local_top_sel = jax.lax.top_k(local_ar, k_max)  # (B/data, T, k_max)
-        # Convert local indices to global N-indices
-        pool_start      = pool_rank * N_local
-        local_top_idx   = local_top_sel + pool_start               # (B/data, T, k_max)
+        # ── Local top-k + global merge ───────────────────────────────────
+        local_top_vals, local_top_sel = jax.lax.top_k(local_ar, k_max)
+        pool_start    = pool_rank * N_local
+        local_top_idx = local_top_sel + pool_start
 
-        # ── All-gather local top-k across pool shards ────────────────────
-        # Only communicates (pool, B/data, T, k_max) — tiny vs (B,T,N).
-        # At 7B: 4 × 4 × 2048 × 32 × 4B = 4 MB vs 0.5 GB for full sims.
         all_top_vals = lax.all_gather(local_top_vals, axis_name='pool', axis=0, tiled=False)
         all_top_idx  = lax.all_gather(local_top_idx,  axis_name='pool', axis=0, tiled=False)
         # (pool, B/data, T, k_max) → merge into (B/data, T, pool*k_max)
@@ -531,28 +530,96 @@ def make_pool_parallel_retrieve(ctx: MeshContext, k_max: int, T: float):
         top_idx  = jnp.take_along_axis(merged_idx, sel, axis=-1)  # (B/data, T, k_max)
         alpha    = top_vals / (jnp.sum(top_vals, axis=-1, keepdims=True) + 1e-8)
 
-        # ── Distributed gather of pool vectors ────────────────────────────
-        # Each shard contributes its local slice; masked-psum merges all shards.
-        # Cost per step: k_max * D floats communicated — tiny even at 7B.
-        in_shard      = (top_idx >= pool_start) & (top_idx < pool_start + N_local)
-        local_idx     = jnp.where(in_shard, top_idx - pool_start, 0)
-        local_vecs    = pool_vecs[local_idx]                        # (B/data, T, k_max, D)
-        local_vecs    = jnp.where(in_shard[..., None], local_vecs, 0.0)
-        gathered_vecs = lax.psum(local_vecs, axis_name='pool')     # (B/data, T, k_max, D)
-
-        # ── Seq-mean aux tensors (avoid (B,T,N) materialization) ──────────
-        # Reduce local sims to (B, N/pool) first, then all_gather to (B, N).
+        # ── Seq-mean aux tensors ──────────────────────────────────────────
         local_sims_seq = local_sims.mean(axis=1)                   # (B/data, N/pool)
         local_ar_seq   = local_ar.mean(axis=1)                     # (B/data, N/pool)
         all_sims_seq   = lax.all_gather(local_sims_seq, axis_name='pool', axis=0, tiled=False)
         all_ar_seq     = lax.all_gather(local_ar_seq,   axis_name='pool', axis=0, tiled=False)
-        # (pool, B/data, N/pool) → (B/data, N)
         sims_seq       = all_sims_seq.transpose(1, 0, 2).reshape(B_local, pool_size * N_local)
         alpha_raw_seq  = all_ar_seq.transpose(1, 0, 2).reshape(B_local, pool_size * N_local)
 
-        return alpha, top_idx, sims_seq, alpha_raw_seq, gathered_vecs
+        return alpha, top_idx, sims_seq, alpha_raw_seq
 
-    return _retrieve
+    # ── Sharded assembly shard_map ───────────────────────────────────────
+    # Gathers only (B,T,k_max, D_local) per chip — eliminates the 9 GB tensor.
+    # psums the tiny (B,T,d_B) h_delta instead.
+    # ICI cost: psum of (B/data,T,d_B) ≈ 64 MB  vs  9 GB for the old gather.
+    @functools.partial(
+        shard_map,
+        mesh=mesh,
+        in_specs=(
+            P('data', None, None),   # h_A:      (B/data, T, d_A)
+            P('pool', None),          # pool_vecs: (N/pool, D) — N sharded
+            P('data', None, None),   # top_idx:  (B/data, T, k_max) global indices
+            P('data', None, None),   # alpha:    (B/data, T, k_max)
+            P(None, None),           # W_base:   (d_B, d_A) replicated
+            P(None),                 # b_base:   (d_B,) replicated
+        ),
+        out_specs=P('data', None, None),  # h_precomputed: (B/data, T, d_B)
+        check_rep=False,
+    )
+    def _assemble(h_A, pool_vecs, top_idx, alpha, W_base, b_base):
+        """
+        Sharded assembly: avoids the 9 GB (B,T,k_max,D) gather.
+
+        Each chip:
+          1. Gathers D_local-shard slice: (B,T,k_max, D_local) — 4x smaller
+          2. Decomposes into U_local/V_local/b_local via static offsets
+          3. Runs partial einsum: h_delta_partial (B,T,d_B)
+          4. psum across pool axis → correct full h_delta
+          5. Only shard 0 adds W_base/b_base to avoid double-counting
+        """
+        N_local    = pool_vecs.shape[0]
+        pool_rank  = lax.axis_index('pool')
+        pool_start = pool_rank * N_local
+
+        in_shard  = (top_idx >= pool_start) & (top_idx < pool_start + N_local)
+        local_idx = jnp.where(in_shard, top_idx - pool_start, 0)
+
+        # pool_vecs is (N_local, D_full) inside shard_map — only N is sharded.
+        # To get D_local columns we slice pool_vecs along D using pool_rank.
+        # Each chip's [pool_rank*D_local : (pool_rank+1)*D_local] is the
+        # D-shard that corresponds to its static shard_offsets entry.
+        d_start = pool_rank * D_local_static
+        # lax.dynamic_slice_in_dim avoids negative-index issues in traced code.
+        pool_vecs_d = lax.dynamic_slice_in_dim(
+            pool_vecs, d_start, D_local_static, axis=1
+        )  # (N_local, D_local)
+
+        # Gather only (B/data, T, k_max, D_local) — 4× smaller than D_full
+        local_vecs = pool_vecs_d[local_idx]
+        local_vecs = jnp.where(in_shard[..., None], local_vecs, 0.0)
+
+
+        # Use lax.switch to select the static offsets for this pool shard.
+        # All branches compile identically; dead ones are eliminated by XLA DCE.
+        def _branch_fn(shard_rank):
+            off_V, off_b, end_b = shard_offsets[shard_rank]
+            return partial_uv_einsum(
+                h_A, local_vecs, alpha,
+                off_V, off_b, end_b,
+                d_B, 0, d_A,
+            )
+
+        h_delta_p, b_delta_p = lax.switch(
+            pool_rank,
+            [functools.partial(_branch_fn, i) for i in range(pool_size)],
+        )
+
+        # h_base: shard 0 contributes W_base; others return zeros.
+        # lax.cond avoids Python-level branch that would confuse the tracer.
+        zero_dB = jnp.zeros((*h_A.shape[:-1], d_B), dtype=h_A.dtype)
+        h_base_p = lax.cond(
+            pool_rank == 0,
+            lambda: jnp.einsum('...d,id->...i', h_A, W_base) + b_base,
+            lambda: zero_dB,
+        )
+
+        # psum: each chip contributes its partial; result is correct full h_delta
+        return lax.psum(h_delta_p + b_delta_p + h_base_p, axis_name='pool')
+
+    return _retrieve, _assemble
+
 
 
 # ── Batch sharding helper ──────────────────────────────────────────────────
@@ -665,7 +732,10 @@ def make_sharded_train_step(model, optimizer, cfg, ctx: MeshContext):
     #   Stage 2 (inside shard_map): pool-parallel retrieval + assembly + PartB + loss
     # This avoids threading all of PartA's weights through the shard_map in_specs.
 
-    pool_retrieve = make_pool_parallel_retrieve(ctx, k_max, T)
+    pool_retrieve, pool_assemble = make_pool_parallel_retrieve(
+        ctx, k_max, T,
+        d_B=cfg.d_B, r=cfg.r, d_A=cfg.d_A,
+    )
 
     @nnx.jit(static_argnums=(3, 4, 8))
     def _sharded_step(model, optimizer, batch, use_sigmoid, soft_flag,
@@ -711,7 +781,7 @@ def make_sharded_train_step(model, optimizer, cfg, ctx: MeshContext):
                 z = block.query_proj(h)
 
                 # Stage 2: pool-parallel retrieval (shard_map, both axes active)
-                alpha, top_idx, sims_seq, alpha_raw_seq, gathered_vecs = pool_retrieve(
+                alpha, top_idx, sims_seq, alpha_raw_seq = pool_retrieve(
                     z, pool_vecs,
                     block.retrieval.W_K.value,
                     block.retrieval.W_Q.value,
@@ -720,8 +790,15 @@ def make_sharded_train_step(model, optimizer, cfg, ctx: MeshContext):
                     jnp.array(lambda_sharp),
                 )
 
+                # Sharded assembly: gathers D_local slice per chip, psums (B,T,d_B).
+                # Eliminates the 9 GB (B,T,k_max,D) gathered tensor entirely.
+                h_precomputed = pool_assemble(
+                    h, pool_vecs, top_idx, alpha,
+                    block.assembler.W_base.value,
+                    block.assembler.b_base.value,
+                )
                 h = block.assembler(h, alpha, top_idx, pool_vecs,
-                                    pre_gathered_vecs=gathered_vecs)
+                                    h_precomputed=h_precomputed)
 
                 alpha_list.append(alpha)
                 idx_list.append(top_idx)
