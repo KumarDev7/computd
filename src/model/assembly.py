@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.sharding import NamedSharding, PartitionSpec as P
 
 
 class WeightAssembler(nnx.Module):
@@ -34,8 +35,8 @@ class WeightAssembler(nnx.Module):
         self._end_b = d_B * r + r * d_A + d_B
 
         # Base weight and bias — zero init forces model to learn from pool from the start
-        self.W_base = nnx.Param(jnp.zeros((d_B, d_A)))
-        self.b_base = nnx.Param(jnp.zeros(d_B))
+        self.W_base = nnx.Param(jnp.zeros((d_B, d_A), dtype=jnp.bfloat16))
+        self.b_base = nnx.Param(jnp.zeros(d_B, dtype=jnp.bfloat16))
 
         # LoRA-style residual scale — init 1.0 so pool contribution is immediately active
         self.gamma = nnx.Param(jnp.array(1.0))
@@ -77,6 +78,7 @@ class WeightAssembler(nnx.Module):
         alpha: jax.Array,   # (batch, [seq,] k_max)
         idx: jax.Array,     # (batch, k_max) seq-level  OR  (batch, seq, k_max) per-position
         vectors: jax.Array, # (N, D)
+        mesh=None,
     ) -> jax.Array:
         """Returns h_mid (batch, [seq,] d_B) after middle layer."""
         gamma    = self.gamma.value
@@ -100,6 +102,14 @@ class WeightAssembler(nnx.Module):
             # Hard: idx is (batch, k_max) seq-level or (batch, seq, k_max) per-position.
             # Hybrid: idx is always (batch, seq, k_max) per-position.
             selected = vectors[idx]   # (batch, k_max, D)  or  (batch, seq, k_max, D)
+            # Shard selected across TP to avoid materializing the full (B,S,K,D) on one chip.
+            if mesh is not None and selected.ndim >= 3:
+                ndim = selected.ndim
+                spec = [None] * ndim
+                spec[0] = 'tp'  # batch dimension
+                selected = jax.lax.with_sharding_constraint(
+                    selected, NamedSharding(mesh, P(*spec))
+                )
             U      = selected[..., :self._off_V].reshape(*selected.shape[:-1], self.d_B, self.r)
             V      = selected[..., self._off_V:self._off_b].reshape(*selected.shape[:-1], self.r, self.d_A)
             b_vecs = selected[..., self._off_b:self._end_b]

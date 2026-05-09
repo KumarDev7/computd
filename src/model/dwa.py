@@ -88,10 +88,10 @@ class DWABlock(nnx.Module):
             self.query_proj.kernel.value = init_sharded_param(
                 (d_model, d_model),
                 NamedSharding(mesh, P(None, 'tp')),
-                rngs.params(), scale=jnp.sqrt(2.0 / d_model),
+                rngs.params(), scale=jnp.sqrt(2.0 / d_model), dtype=jnp.bfloat16,
             )
         else:
-            self.query_proj = nnx.Linear(d_model, d_model, rngs=rngs)
+            self.query_proj = nnx.Linear(d_model, d_model, param_dtype=jnp.bfloat16, rngs=rngs)
 
         self.retrieval  = MultiAspectRetrieval(D=D, d_A=d_model, S=S, d_k=d_k, N=N, rngs=rngs,
                                                wk_sharding=wk_sharding)
@@ -126,7 +126,7 @@ class DWABlock(nnx.Module):
                 z, self.retrieval, pool_vectors, k_max, T, lambda_sharp, use_sigmoid, forced_idx
             )
 
-        h_out = self.assembler(h, alpha, idx, pool_vectors)
+        h_out = self.assembler(h, alpha, idx, pool_vectors, mesh=mesh)
         return h_out, alpha, idx, sims, alpha_raw
 
 
@@ -185,10 +185,15 @@ class DWAModel(nnx.Module):
 
         alpha_list, idx_list, sims_list, alpha_raw_list = [], [], [], []
         for block in self.blocks:
-            h, alpha, idx, sims, alpha_raw = block(
-                h, pool_vecs, cfg.k_max, cfg.T, lambda_sharp, use_sigmoid, forced_idx,
-                soft=soft, hybrid=hybrid, pallas=pallas, tp_axis=tp_axis, mesh=mesh,
-            )
+            # jax.remat (gradient checkpointing) prevents XLA from scheduling all 18
+            # pool all-gathers (4.25 GiB each) simultaneously in the compiled HLO.
+            # Each block's all-gather is freed after forward and recomputed during backward.
+            def _run_block(h, _b=block):
+                return _b(
+                    h, pool_vecs, cfg.k_max, cfg.T, lambda_sharp, use_sigmoid, forced_idx,
+                    soft=soft, hybrid=hybrid, pallas=pallas, tp_axis=tp_axis, mesh=mesh,
+                )
+            h, alpha, idx, sims, alpha_raw = jax.remat(_run_block)(h)
             alpha_list.append(alpha)
             idx_list.append(idx)
             sims_list.append(sims)

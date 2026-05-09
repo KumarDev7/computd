@@ -31,12 +31,12 @@ class VectorPool(nnx.Module):
                 device_idx = sl0.start // per_device_n
                 shard_key = jax.random.fold_in(key, device_idx)
                 local_shape = (sl0.stop - sl0.start, D)
-                return jax.random.normal(shard_key, local_shape, dtype=jnp.float32) * 0.02
+                return jax.random.normal(shard_key, local_shape, dtype=jnp.bfloat16) * 0.02
             vectors = jax.make_array_from_callback(
                 (N, D), sharding, _data_callback
             )
         else:
-            vectors = jax.random.normal(key, (N, D)) * 0.02
+            vectors = jax.random.normal(key, (N, D), dtype=jnp.bfloat16) * 0.02
         self.vectors = nnx.Param(vectors)
         # EMA of mean α per vector across batches — used in utilization loss
         self.ema_usage = EMAState(jnp.zeros(N))

@@ -205,10 +205,10 @@ def train_loop_7b(
 # ---------------------------------------------------------------------------
 
 TOTAL_STEPS  = 20_000
-BATCH_SIZE   = 16      # global batch — keep small to fit 16 GB/chip activations
+BATCH_SIZE   = 4       # batch replicated across TP; (4,256,32,69632)bf16=4.25GiB per block
 LOG_EVERY    = 100
 GEN_EVERY    = 2000
-SEQ_LEN_OVERRIDE = 512   # override 7B config's 2048 for initial TPU run
+SEQ_LEN_OVERRIDE = 256  # 512 at k=32,D=69632 is 9 GB selected gather even in bf16
 
 if __name__ == '__main__':
     env_check()

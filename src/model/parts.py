@@ -42,17 +42,17 @@ class CausalSelfAttention(nnx.Module):
             self.qkv.kernel.value = init_sharded_param(
                 (d_model, 3 * d_model),
                 NamedSharding(mesh, P(None, 'tp')),
-                rng_key, scale=jnp.sqrt(2.0 / d_model),
+                rng_key, scale=jnp.sqrt(2.0 / d_model), dtype=jnp.bfloat16,
             )
             self.proj = nnx.Linear(d_model, d_model, use_bias=False, rngs=rngs)
             self.proj.kernel.value = init_sharded_param(
                 (d_model, d_model),
                 NamedSharding(mesh, P('tp', None)),
-                rng_key, scale=jnp.sqrt(2.0 / d_model),
+                rng_key, scale=jnp.sqrt(2.0 / d_model), dtype=jnp.bfloat16,
             )
         else:
-            self.qkv  = nnx.Linear(d_model, 3 * d_model, use_bias=False, rngs=rngs)
-            self.proj = nnx.Linear(d_model, d_model, use_bias=False, rngs=rngs)
+            self.qkv  = nnx.Linear(d_model, 3 * d_model, use_bias=False, param_dtype=jnp.bfloat16, rngs=rngs)
+            self.proj = nnx.Linear(d_model, d_model, use_bias=False, param_dtype=jnp.bfloat16, rngs=rngs)
 
         self.norm = nnx.LayerNorm(d_model, rngs=rngs)
         self._freqs = _rope_freqs(self.d_head, max_seq_len)
@@ -98,22 +98,22 @@ class PartA(nnx.Module):
             self.fc1.kernel.value = init_sharded_param(
                 (d_input, hidden),
                 NamedSharding(mesh, P(None, 'tp')),
-                rngs.params(), scale=jnp.sqrt(2.0 / d_input),
+                rngs.params(), scale=jnp.sqrt(2.0 / d_input), dtype=jnp.bfloat16,
             )
             self.fc1.bias.value = init_sharded_param(
                 (hidden,),
                 NamedSharding(mesh, P('tp',)),
-                rngs.params(), scale=0.0,
+                rngs.params(), scale=0.0, dtype=jnp.bfloat16,
             )
             self.fc2 = nnx.Linear(hidden, d_A, rngs=rngs)
             self.fc2.kernel.value = init_sharded_param(
                 (hidden, d_A),
                 NamedSharding(mesh, P('tp', None)),
-                rngs.params(), scale=jnp.sqrt(2.0 / hidden),
+                rngs.params(), scale=jnp.sqrt(2.0 / hidden), dtype=jnp.bfloat16,
             )
         else:
-            self.fc1 = nnx.Linear(d_input, hidden, rngs=rngs)
-            self.fc2 = nnx.Linear(hidden, d_A, rngs=rngs)
+            self.fc1 = nnx.Linear(d_input, hidden, param_dtype=jnp.bfloat16, rngs=rngs)
+            self.fc2 = nnx.Linear(hidden, d_A, param_dtype=jnp.bfloat16, rngs=rngs)
 
         self.attn = (CausalSelfAttention(d_A, n_heads, max_seq_len, rngs, mesh=mesh)
                      if n_heads > 0 else None)
@@ -139,22 +139,22 @@ class PartB(nnx.Module):
             self.fc1.kernel.value = init_sharded_param(
                 (d_B, hidden),
                 NamedSharding(mesh, P(None, 'tp')),
-                rngs.params(), scale=jnp.sqrt(2.0 / d_B),
+                rngs.params(), scale=jnp.sqrt(2.0 / d_B), dtype=jnp.bfloat16,
             )
             self.fc1.bias.value = init_sharded_param(
                 (hidden,),
                 NamedSharding(mesh, P('tp',)),
-                rngs.params(), scale=0.0,
+                rngs.params(), scale=0.0, dtype=jnp.bfloat16,
             )
             self.fc2 = nnx.Linear(hidden, d_output, rngs=rngs)
             self.fc2.kernel.value = init_sharded_param(
                 (hidden, d_output),
                 NamedSharding(mesh, P('tp', None)),
-                rngs.params(), scale=jnp.sqrt(2.0 / hidden),
+                rngs.params(), scale=jnp.sqrt(2.0 / hidden), dtype=jnp.bfloat16,
             )
         else:
-            self.fc1 = nnx.Linear(d_B, hidden, rngs=rngs)
-            self.fc2 = nnx.Linear(hidden, d_output, rngs=rngs)
+            self.fc1 = nnx.Linear(d_B, hidden, param_dtype=jnp.bfloat16, rngs=rngs)
+            self.fc2 = nnx.Linear(hidden, d_output, param_dtype=jnp.bfloat16, rngs=rngs)
 
     def __call__(self, h_mid: jax.Array) -> jax.Array:
         h = jax.nn.gelu(self.fc1(self.norm_in(h_mid)))

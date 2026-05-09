@@ -88,6 +88,10 @@ def _sharding_for_param(path_str: str, arr: jax.Array, mesh: Mesh) -> NamedShard
     if 'query_proj/kernel' in path_str and ndim == 2:
         return NamedSharding(mesh, P(None, 'tp'))
 
+    # ---- WeightAssembler W_base (d_B, d_A) → column parallel P(None, 'tp') ----
+    if 'assembler' in path_str and 'W_base' in path_str and ndim == 2:
+        return NamedSharding(mesh, P(None, 'tp'))
+
     # Everything else replicated
     return NamedSharding(mesh, P(*([None] * ndim)))
 

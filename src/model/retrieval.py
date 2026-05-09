@@ -25,23 +25,22 @@ class MultiAspectRetrieval(nnx.Module):
         self.N = N
 
         self.W_Q = nnx.Param(
-            jax.random.normal(rngs.params(), (S, d_k, d_A)) * (d_A ** -0.5)
+            (jax.random.normal(rngs.params(), (S, d_k, d_A)) * (d_A ** -0.5)).astype(jnp.bfloat16)
         )
         if wk_sharding is not None:
             # Create W_K directly sharded to avoid OOM on one device.
             # (S, d_k, D) sharded as P(None, None, 'tp') — D split across chips.
             wk_shape = (S, d_k, D)
             def _wk_callback(idx):
-                # idx[2].start // (D // n_devices) gives the device index
                 n_dev = wk_sharding.mesh.size
                 d_local = D // n_dev
                 dev_idx = idx[2].start // d_local
-                k = jax.random.fold_in(rngs.params(), dev_idx + 100)  # different seed per shard
+                k = jax.random.fold_in(rngs.params(), dev_idx + 100)
                 local_shape = (S, d_k, idx[2].stop - idx[2].start)
-                return jax.random.normal(k, local_shape, dtype=jnp.float32) * (D ** -0.5)
+                return jax.random.normal(k, local_shape, dtype=jnp.bfloat16) * (D ** -0.5)
             W_K_val = jax.make_array_from_callback(wk_shape, wk_sharding, _wk_callback)
         else:
-            W_K_val = jax.random.normal(rngs.params(), (S, d_k, D)) * (D ** -0.5)
+            W_K_val = (jax.random.normal(rngs.params(), (S, d_k, D)) * (D ** -0.5)).astype(jnp.bfloat16)
         self.W_K = nnx.Param(W_K_val)
         self.aspect_logits = nnx.Param(jnp.zeros(S))
         self.tau = nnx.Param(jnp.zeros(S))
