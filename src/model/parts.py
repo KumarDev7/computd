@@ -1,22 +1,23 @@
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+from src.training.sharding import init_sharded_param
 
 
 # ─── RoPE helpers ─────────────────────────────────────────────────────────────
 
 def _rope_freqs(d_head: int, max_seq: int) -> jax.Array:
-    """(max_seq, d_head/2) rotation frequencies."""
     theta = 1.0 / (10000.0 ** (jnp.arange(0, d_head, 2) / d_head))
     pos   = jnp.arange(max_seq)
-    return jnp.outer(pos, theta)   # (max_seq, d_head/2)
+    return jnp.outer(pos, theta)
 
 
 def _apply_rope(x: jax.Array, freqs: jax.Array) -> jax.Array:
-    """x: (..., seq, d_head)  freqs: (max_seq, d_head/2)"""
     seq = x.shape[-2]
-    f   = freqs[:seq]                    # (seq, d_head/2)
-    x1, x2 = x[..., ::2], x[..., 1::2]  # even / odd dims
+    f   = freqs[:seq]
+    x1, x2 = x[..., ::2], x[..., 1::2]
     rot = jnp.concatenate(
         [x1 * jnp.cos(f) - x2 * jnp.sin(f),
          x1 * jnp.sin(f) + x2 * jnp.cos(f)], axis=-1
@@ -27,19 +28,33 @@ def _apply_rope(x: jax.Array, freqs: jax.Array) -> jax.Array:
 # ─── Causal Self-Attention ────────────────────────────────────────────────────
 
 class CausalSelfAttention(nnx.Module):
-    """1-layer causal MHA with RoPE — gives PartA cross-position context."""
 
-    def __init__(self, d_model: int, n_heads: int, max_seq_len: int = 256, rngs: nnx.Rngs = None):
+    def __init__(self, d_model: int, n_heads: int, max_seq_len: int = 256,
+                 rngs: nnx.Rngs = None, mesh: Mesh = None):
         assert d_model % n_heads == 0
         self.n_heads = n_heads
         self.d_head  = d_model // n_heads
         self.scale   = self.d_head ** -0.5
 
-        self.qkv  = nnx.Linear(d_model, 3 * d_model, use_bias=False, rngs=rngs)
-        self.proj = nnx.Linear(d_model, d_model, use_bias=False, rngs=rngs)
-        self.norm = nnx.LayerNorm(d_model, rngs=rngs)
+        rng_key = rngs.params()
+        if mesh is not None:
+            self.qkv = nnx.Linear(d_model, 3 * d_model, use_bias=False, rngs=rngs)
+            self.qkv.kernel.value = init_sharded_param(
+                (d_model, 3 * d_model),
+                NamedSharding(mesh, P(None, 'tp')),
+                rng_key, scale=jnp.sqrt(2.0 / d_model),
+            )
+            self.proj = nnx.Linear(d_model, d_model, use_bias=False, rngs=rngs)
+            self.proj.kernel.value = init_sharded_param(
+                (d_model, d_model),
+                NamedSharding(mesh, P('tp', None)),
+                rng_key, scale=jnp.sqrt(2.0 / d_model),
+            )
+        else:
+            self.qkv  = nnx.Linear(d_model, 3 * d_model, use_bias=False, rngs=rngs)
+            self.proj = nnx.Linear(d_model, d_model, use_bias=False, rngs=rngs)
 
-        # Pre-compute RoPE frequencies and causal mask (static — not parameters)
+        self.norm = nnx.LayerNorm(d_model, rngs=rngs)
         self._freqs = _rope_freqs(self.d_head, max_seq_len)
         self._mask  = jnp.tril(jnp.ones((max_seq_len, max_seq_len), dtype=bool))
 
@@ -71,28 +86,39 @@ class CausalSelfAttention(nnx.Module):
 # ─── PartA ────────────────────────────────────────────────────────────────────
 
 class PartA(nnx.Module):
-    """
-    Encoder half: maps input features → h_A (d_A) and produces per-position query z.
-    2-layer MLP with GELU + pre-norm, plus optional causal self-attention (n_heads>0)
-    for cross-position context, plus a projection head for z.
-    """
 
     def __init__(self, d_input: int, d_A: int, n_heads: int = 0,
-                 max_seq_len: int = 256, rngs: nnx.Rngs = None):
+                 max_seq_len: int = 256, rngs: nnx.Rngs = None, mesh: Mesh = None):
         hidden = d_A * 4
         self.norm_in  = nnx.LayerNorm(d_input, rngs=rngs)
-        self.fc1      = nnx.Linear(d_input, hidden, rngs=rngs)
-        self.fc2      = nnx.Linear(hidden, d_A, rngs=rngs)
         self.norm_out = nnx.LayerNorm(d_A, rngs=rngs)
 
-        self.attn = (CausalSelfAttention(d_A, n_heads, max_seq_len, rngs)
+        if mesh is not None:
+            self.fc1 = nnx.Linear(d_input, hidden, rngs=rngs)
+            self.fc1.kernel.value = init_sharded_param(
+                (d_input, hidden),
+                NamedSharding(mesh, P(None, 'tp')),
+                rngs.params(), scale=jnp.sqrt(2.0 / d_input),
+            )
+            self.fc1.bias.value = init_sharded_param(
+                (hidden,),
+                NamedSharding(mesh, P('tp',)),
+                rngs.params(), scale=0.0,
+            )
+            self.fc2 = nnx.Linear(hidden, d_A, rngs=rngs)
+            self.fc2.kernel.value = init_sharded_param(
+                (hidden, d_A),
+                NamedSharding(mesh, P('tp', None)),
+                rngs.params(), scale=jnp.sqrt(2.0 / hidden),
+            )
+        else:
+            self.fc1 = nnx.Linear(d_input, hidden, rngs=rngs)
+            self.fc2 = nnx.Linear(hidden, d_A, rngs=rngs)
+
+        self.attn = (CausalSelfAttention(d_A, n_heads, max_seq_len, rngs, mesh=mesh)
                      if n_heads > 0 else None)
 
     def __call__(self, x: jax.Array):
-        """
-        x: (batch, [seq,] d_input) — token one-hots
-        Returns h_A (batch, [seq,] d_A).
-        """
         h   = jax.nn.gelu(self.fc1(self.norm_in(x)))
         h_A = self.norm_out(self.fc2(h))
 
@@ -102,19 +128,33 @@ class PartA(nnx.Module):
         return h_A
 
 
-# ─── PartB ────────────────────────────────────────────────────────────────────
-
 class PartB(nnx.Module):
-    """
-    Decoder half: maps h_mid (d_B) → output logits (d_output).
-    2-layer MLP with GELU + pre-norm.
-    """
 
-    def __init__(self, d_B: int, d_output: int, rngs: nnx.Rngs):
+    def __init__(self, d_B: int, d_output: int, rngs: nnx.Rngs, mesh: Mesh = None):
         hidden = d_B * 4
         self.norm_in = nnx.LayerNorm(d_B, rngs=rngs)
-        self.fc1 = nnx.Linear(d_B, hidden, rngs=rngs)
-        self.fc2 = nnx.Linear(hidden, d_output, rngs=rngs)
+
+        if mesh is not None:
+            self.fc1 = nnx.Linear(d_B, hidden, rngs=rngs)
+            self.fc1.kernel.value = init_sharded_param(
+                (d_B, hidden),
+                NamedSharding(mesh, P(None, 'tp')),
+                rngs.params(), scale=jnp.sqrt(2.0 / d_B),
+            )
+            self.fc1.bias.value = init_sharded_param(
+                (hidden,),
+                NamedSharding(mesh, P('tp',)),
+                rngs.params(), scale=0.0,
+            )
+            self.fc2 = nnx.Linear(hidden, d_output, rngs=rngs)
+            self.fc2.kernel.value = init_sharded_param(
+                (hidden, d_output),
+                NamedSharding(mesh, P('tp', None)),
+                rngs.params(), scale=jnp.sqrt(2.0 / hidden),
+            )
+        else:
+            self.fc1 = nnx.Linear(d_B, hidden, rngs=rngs)
+            self.fc2 = nnx.Linear(hidden, d_output, rngs=rngs)
 
     def __call__(self, h_mid: jax.Array) -> jax.Array:
         h = jax.nn.gelu(self.fc1(self.norm_in(h_mid)))

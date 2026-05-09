@@ -1,11 +1,13 @@
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.sharding import NamedSharding, PartitionSpec as P
 
 from .parts import PartA, PartB, CausalSelfAttention
 from .pool import VectorPool
 from .retrieval import MultiAspectRetrieval
 from .assembly import WeightAssembler
+from src.training.sharding import init_sharded_param
 
 
 def _retrieve_per_position(z, retrieval_module, pool_vectors, k_max, T, lambda_sharp,
@@ -73,17 +75,24 @@ def _retrieve_per_position(z, retrieval_module, pool_vectors, k_max, T, lambda_s
 
 
 class DWABlock(nnx.Module):
-    """
-    One DWA assembly block: optional causal attention → query projection →
-    per-position retrieval → weight assembly.
-    """
 
     def __init__(self, d_model: int, r: int, S: int, d_k: int, N: int, D: int,
-                 n_heads: int, max_seq_len: int, rngs: nnx.Rngs, wk_sharding=None):
+                 n_heads: int, max_seq_len: int, rngs: nnx.Rngs,
+                 wk_sharding=None, mesh=None):
         self.n_heads = n_heads
         if n_heads > 0:
-            self.attn = CausalSelfAttention(d_model, n_heads, max_seq_len, rngs)
-        self.query_proj = nnx.Linear(d_model, d_model, rngs=rngs)
+            self.attn = CausalSelfAttention(d_model, n_heads, max_seq_len, rngs, mesh=mesh)
+
+        if mesh is not None:
+            self.query_proj = nnx.Linear(d_model, d_model, rngs=rngs)
+            self.query_proj.kernel.value = init_sharded_param(
+                (d_model, d_model),
+                NamedSharding(mesh, P(None, 'tp')),
+                rngs.params(), scale=jnp.sqrt(2.0 / d_model),
+            )
+        else:
+            self.query_proj = nnx.Linear(d_model, d_model, rngs=rngs)
+
         self.retrieval  = MultiAspectRetrieval(D=D, d_A=d_model, S=S, d_k=d_k, N=N, rngs=rngs,
                                                wk_sharding=wk_sharding)
         self.assembler  = WeightAssembler(d_model, d_model, r, rngs=rngs)
@@ -137,24 +146,22 @@ class DWAModel(nnx.Module):
         max_seq_len = getattr(config, 'max_seq_len', 256)
 
         self.config = config
-        self._mesh  = mesh   # also set by shard_model() if constructed later
+        self._mesh  = mesh
 
-        # Pre-compute shardings if mesh is available — avoids OOM on init
         pool_sharding = None
         wk_sharding   = None
         if mesh is not None:
-            from jax.sharding import NamedSharding, PartitionSpec as P
             pool_sharding = NamedSharding(mesh, P('tp', None))
             wk_sharding   = NamedSharding(mesh, P(None, None, 'tp'))
 
-        self.part_a = PartA(config.d_input, config.d_A, n_heads=0, rngs=rngs)  # MLP only
+        self.part_a = PartA(config.d_input, config.d_A, n_heads=0, rngs=rngs, mesh=mesh)
         self.pool   = VectorPool(config.N, config.D, rngs=rngs, sharding=pool_sharding)
         self.blocks = nnx.List([
             DWABlock(config.d_A, config.r, config.S, config.d_k, config.N, config.D,
-                     n_heads, max_seq_len, rngs, wk_sharding=wk_sharding)
+                     n_heads, max_seq_len, rngs, wk_sharding=wk_sharding, mesh=mesh)
             for _ in range(n_layers)
         ])
-        self.part_b = PartB(config.d_B, config.d_input, rngs=rngs)
+        self.part_b = PartB(config.d_B, config.d_input, rngs=rngs, mesh=mesh)
 
     def __call__(
         self,

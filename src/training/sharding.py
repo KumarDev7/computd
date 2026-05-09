@@ -58,8 +58,7 @@ def _sharding_for_param(path_str: str, arr: jax.Array, mesh: Mesh) -> NamedShard
         return NamedSharding(mesh, P('tp', None))
 
     # ---- Retrieval W_K (S, d_k, D) — shard D across 'tp' ----
-    #  W_K is the memory bottleneck: (16, 128, 69632) = 570 MB per block
-    if 'W_K' in path_str and 'kernel' in path_str and ndim == 3:
+    if 'W_K' in path_str and ndim == 3:
         return NamedSharding(mesh, P(None, None, 'tp'))
 
     # ---- PartA / PartB MLP column-row parallelism ----
@@ -76,8 +75,19 @@ def _sharding_for_param(path_str: str, arr: jax.Array, mesh: Mesh) -> NamedShard
             return NamedSharding(mesh, P('tp', None))
         # bias replicated
 
-    # DWABlock assembly W_base, gamma — replicate
-    # Retrieval W_Q, W_K, aspect_logits, tau — replicate
+    # ---- Attention in DWABlocks: column-row parallel ----
+    # qkv kernel: (d_model, 3*d_model) → column parallel P(None, 'tp')
+    if 'attn/qkv/kernel' in path_str and ndim == 2:
+        return NamedSharding(mesh, P(None, 'tp'))
+    # proj kernel: (d_model, d_model) → row parallel P('tp', None)
+    if 'attn/proj/kernel' in path_str and ndim == 2:
+        return NamedSharding(mesh, P('tp', None))
+
+    # ---- Query projection in DWABlocks ----
+    # query_proj kernel: (d_model, d_model) → column parallel P(None, 'tp')
+    if 'query_proj/kernel' in path_str and ndim == 2:
+        return NamedSharding(mesh, P(None, 'tp'))
+
     # Everything else replicated
     return NamedSharding(mesh, P(*([None] * ndim)))
 
@@ -88,7 +98,7 @@ def shard_model(model: nnx.Module, mesh: Mesh) -> None:
     Also stores mesh on model for use by pallas_hybrid_forward.
     Call once after model creation, before JIT-compiling train_step.
 
-    Skips params already correctly sharded (e.g. pool/W_K init-sharded).
+    Skips params already correctly sharded (e.g. pool/W_K/MLP init-sharded).
     """
     model._mesh = mesh
     graphdef, state = nnx.split(model)
@@ -100,33 +110,127 @@ def shard_model(model: nnx.Module, mesh: Mesh) -> None:
             str(p.key) if hasattr(p, 'key') else str(p) for p in path
         )
         target = _sharding_for_param(path_str, leaf, mesh)
-        # Skip params already on the correct sharding (init-sharded pool/W_K)
+        # Skip params already on the correct sharding
         if hasattr(leaf, 'sharding') and leaf.sharding is not None:
             try:
                 if leaf.sharding == target:
                     return leaf
             except Exception:
                 pass
-        # Skip SingleDeviceSharding params > 100 MB — these must be init-sharded
-        # or they'll OOM during device_put (too large to replicate to all devices)
-        if leaf.size * leaf.dtype.itemsize > 100_000_000:  # > 100 MB
-            from jax.sharding import SingleDeviceSharding
-            if isinstance(leaf.sharding, SingleDeviceSharding):
-                # Not yet sharded but too large for device_put — skip with warning
-                import warnings
-                warnings.warn(f'Skipping sharding of large param {path_str} '
-                              f'({leaf.size * leaf.dtype.itemsize / 1e6:.0f} MB) '
-                              f'on single device. Init-shard it or reduce size.')
-                return leaf
         return jax.device_put(leaf, target)
 
     sharded_state = jax.tree_util.tree_map_with_path(_shard_leaf, state)
     nnx.update(model, sharded_state)
 
 
+def shard_optimizer(optimizer: nnx.Optimizer, model: nnx.Module, mesh: Mesh) -> None:
+    """
+    Shard optimizer state (Adam m, v) to match parameter sharding.
+    Must be called after shard_model().
+    """
+    graphdef, model_state = nnx.split(model)
+    param_state = model_state.filter(nnx.Param)
+    opt_state = optimizer.opt_state
+
+    def _shard_opt_leaf(leaf):
+        if not isinstance(leaf, jax.Array):
+            return leaf
+        # Optimizer state follows the same sharding as its parameter
+        # device_put with replicated sharding for small arrays,
+        # or find the matching param sharding
+        from jax.sharding import SingleDeviceSharding
+        if isinstance(leaf.sharding, SingleDeviceSharding):
+            # Move off device 0 — replicate by default (safe for small arrays)
+            replicated = NamedSharding(mesh, P(*([None] * leaf.ndim)))
+            return jax.device_put(leaf, replicated)
+        return leaf
+
+    sharded_opt_state = jax.tree_util.tree_map(_shard_opt_leaf, opt_state)
+    optimizer.opt_state = sharded_opt_state
+
+
 # ---------------------------------------------------------------------------
 # Sharding constraints for activations (used inside JIT-compiled functions)
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Init-sharded parameter creation (avoids OOM on device 0)
+# ---------------------------------------------------------------------------
+
+def init_sharded_param(
+    shape: tuple[int, ...],
+    sharding: NamedSharding,
+    rng_key: jax.Array,
+    scale: float = 0.02,
+    dtype: jnp.dtype = jnp.float32,
+) -> jax.Array:
+    """
+    Create a sharded parameter directly on all devices — never materialises the
+    full array on a single device.  Uses jax.make_array_from_callback so each
+    device only allocates its own shard.
+    """
+    def _callback(shard_indices):
+        offset = 0
+        local_shape = []
+        for i, (sl, full_dim) in enumerate(zip(shard_indices, shape)):
+            if isinstance(sl, slice):
+                start = sl.start if sl.start is not None else 0
+                stop = sl.stop if sl.stop is not None else full_dim
+                offset += start * (10 ** i)
+                local_shape.append(stop - start)
+            else:
+                offset += sl * (10 ** i)
+                local_shape.append(1)
+        shard_key = jax.random.fold_in(rng_key, offset)
+        return jax.random.normal(shard_key, tuple(local_shape), dtype=dtype) * scale
+
+    return jax.make_array_from_callback(shape, sharding, _callback)
+
+
+def make_linear_sharded(
+    d_in: int,
+    d_out: int,
+    rngs: nnx.Rngs,
+    sharding: NamedSharding | None = None,
+    use_bias: bool = True,
+    kernel_sharding: NamedSharding | None = None,
+    bias_sharding: NamedSharding | None = None,
+) -> nnx.Linear:
+    """
+    Create an nnx.Linear with an init-sharded kernel.
+
+    If sharding is provided, the kernel is created via make_array_from_callback
+    so it never resides on a single device.  Bias is always small and left
+    replicated (or follows kernel row-parallel convention if bias_sharding set).
+
+    Two usage patterns:
+      1. sharding=single_sharding → both kernel and bias use this sharding spec
+         (useful for replicated linesrs).
+      2. kernel_sharding + bias_sharding → fine-grained per-parameter control
+         (useful for TP column/row parallel).
+    """
+    if kernel_sharding is None and sharding is not None:
+        kernel_sharding = sharding
+    if bias_sharding is None and sharding is not None:
+        bias_sharding = sharding
+
+    lin = nnx.Linear(d_in, d_out, use_bias=use_bias, rngs=rngs)
+
+    if kernel_sharding is not None:
+        kernel_key = rngs.params()
+        lin.kernel.value = init_sharded_param(
+            (d_in, d_out), kernel_sharding, kernel_key,
+            scale=jnp.sqrt(2.0 / d_in),   # Kaiming-ish init matching nnx default
+        )
+
+    if use_bias and bias_sharding is not None:
+        # Bias is small enough to replicate; create replicated zero bias
+        lin.bias.value = init_sharded_param(
+            (d_out,), bias_sharding, rngs.params(), scale=0.0,
+        )
+
+    return lin
+
 
 def constrain_replicated(x: jax.Array, mesh: Mesh) -> jax.Array:
     """Mark an activation as replicated across all TP devices."""
