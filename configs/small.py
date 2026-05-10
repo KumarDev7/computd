@@ -60,3 +60,9 @@ class DWAConfig:
     # Same checkpoint works for all modes; switch flag between training and inference.
     soft_train: bool = False
     hybrid_train: bool = False
+
+    # --- Embedding mode ---
+    # use_embedding=True: use Embed(vocab, d_A) + Linear(d_A, d_A) for PartA input
+    # use_embedding=False: use one_hot(vocab) + Linear(vocab, hidden) for PartA input
+    # True avoids materializing (B, seq, vocab) one_hot, critical for large vocab (e.g. 64K)
+    use_embedding: bool = False

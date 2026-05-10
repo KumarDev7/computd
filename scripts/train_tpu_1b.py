@@ -60,14 +60,17 @@ def format_params(n: int) -> str:
 
 
 def make_train_step(cfg, use_sigmoid: bool):
+    use_embed = getattr(cfg, 'use_embedding', False)
+
     @nnx.jit
     def train_step(model, optimizer, batch, lambda_sharp, lambda_entropy_eff, forced_idx):
         soft = getattr(cfg, 'soft_train', False)
         hybrid = getattr(cfg, 'hybrid_train', False)
+        token_ids = batch if use_embed else None
 
         grad_fn = nnx.value_and_grad(loss_fn, argnums=nnx.DiffState(0, nnx.Param), has_aux=True)
         (total_loss, (metrics, aux)), grads = grad_fn(
-            model, batch, use_sigmoid, lambda_sharp, lambda_entropy_eff, forced_idx, soft, hybrid
+            model, batch, use_sigmoid, lambda_sharp, lambda_entropy_eff, forced_idx, soft, hybrid, token_ids
         )
         optimizer.update(model, grads)
 
@@ -182,7 +185,7 @@ def train_loop_1b(
 
 
 TOTAL_STEPS = 5000
-BATCH_SIZE = 4
+BATCH_SIZE = 8
 LOG_EVERY = 50
 SEQ_LEN = 1024
 

@@ -88,39 +88,54 @@ class CausalSelfAttention(nnx.Module):
 class PartA(nnx.Module):
 
     def __init__(self, d_input: int, d_A: int, n_heads: int = 0,
-                 max_seq_len: int = 256, rngs: nnx.Rngs = None, mesh: Mesh = None):
+                 max_seq_len: int = 256, rngs: nnx.Rngs = None, mesh: Mesh = None,
+                 use_embedding: bool = True):
+        self.use_embedding = use_embedding
         hidden = d_A * 4
-        self.norm_in  = nnx.LayerNorm(d_input, rngs=rngs)
-        self.norm_out = nnx.LayerNorm(d_A, rngs=rngs)
 
-        if mesh is not None:
-            self.fc1 = nnx.Linear(d_input, hidden, rngs=rngs)
-            self.fc1.kernel.value = init_sharded_param(
-                (d_input, hidden),
-                NamedSharding(mesh, P(None, 'tp')),
-                rngs.params(), scale=jnp.sqrt(2.0 / d_input), dtype=jnp.bfloat16,
-            )
-            self.fc1.bias.value = init_sharded_param(
-                (hidden,),
-                NamedSharding(mesh, P('tp',)),
-                rngs.params(), scale=0.0, dtype=jnp.bfloat16,
-            )
-            self.fc2 = nnx.Linear(hidden, d_A, rngs=rngs)
-            self.fc2.kernel.value = init_sharded_param(
-                (hidden, d_A),
-                NamedSharding(mesh, P('tp', None)),
-                rngs.params(), scale=jnp.sqrt(2.0 / hidden), dtype=jnp.bfloat16,
-            )
+        if use_embedding:
+            self.embed = nnx.Embed(d_input, d_A, rngs=rngs)
+            self.proj = nnx.Linear(d_A, d_A, use_bias=False, param_dtype=jnp.bfloat16, rngs=rngs)
+            self.norm_out = nnx.LayerNorm(d_A, rngs=rngs)
         else:
-            self.fc1 = nnx.Linear(d_input, hidden, param_dtype=jnp.bfloat16, rngs=rngs)
-            self.fc2 = nnx.Linear(hidden, d_A, param_dtype=jnp.bfloat16, rngs=rngs)
+            self.norm_in  = nnx.LayerNorm(d_input, rngs=rngs)
+            self.norm_out = nnx.LayerNorm(d_A, rngs=rngs)
+
+            if mesh is not None:
+                self.fc1 = nnx.Linear(d_input, hidden, rngs=rngs)
+                self.fc1.kernel.value = init_sharded_param(
+                    (d_input, hidden),
+                    NamedSharding(mesh, P(None, 'tp')),
+                    rngs.params(), scale=jnp.sqrt(2.0 / d_input), dtype=jnp.bfloat16,
+                )
+                self.fc1.bias.value = init_sharded_param(
+                    (hidden,),
+                    NamedSharding(mesh, P('tp',)),
+                    rngs.params(), scale=0.0, dtype=jnp.bfloat16,
+                )
+                self.fc2 = nnx.Linear(hidden, d_A, rngs=rngs)
+                self.fc2.kernel.value = init_sharded_param(
+                    (hidden, d_A),
+                    NamedSharding(mesh, P('tp', None)),
+                    rngs.params(), scale=jnp.sqrt(2.0 / hidden), dtype=jnp.bfloat16,
+                )
+            else:
+                self.fc1 = nnx.Linear(d_input, hidden, param_dtype=jnp.bfloat16, rngs=rngs)
+                self.fc2 = nnx.Linear(hidden, d_A, param_dtype=jnp.bfloat16, rngs=rngs)
 
         self.attn = (CausalSelfAttention(d_A, n_heads, max_seq_len, rngs, mesh=mesh)
                      if n_heads > 0 else None)
 
-    def __call__(self, x: jax.Array):
-        h   = jax.nn.gelu(self.fc1(self.norm_in(x)))
-        h_A = self.norm_out(self.fc2(h))
+    def __call__(self, x: jax.Array, token_ids: jax.Array | None = None):
+        if self.use_embedding and token_ids is not None:
+            h_A = self.proj(self.embed(token_ids))
+            h_A = self.norm_out(h_A)
+        elif self.use_embedding:
+            h_A = self.proj(self.embed(x.argmax(axis=-1) if x.ndim == 3 else x))
+            h_A = self.norm_out(h_A)
+        else:
+            h   = jax.nn.gelu(self.fc1(self.norm_in(x)))
+            h_A = self.norm_out(self.fc2(h))
 
         if self.attn is not None and h_A.ndim == 3:
             h_A = self.attn(h_A)

@@ -154,7 +154,8 @@ class DWAModel(nnx.Module):
             pool_sharding = NamedSharding(mesh, P('tp', None))
             wk_sharding   = NamedSharding(mesh, P(None, None, 'tp'))
 
-        self.part_a = PartA(config.d_input, config.d_A, n_heads=0, rngs=rngs, mesh=mesh)
+        self.part_a = PartA(config.d_input, config.d_A, n_heads=0, rngs=rngs, mesh=mesh,
+                            use_embedding=getattr(config, 'use_embedding', True))
         self.pool   = VectorPool(config.N, config.D, rngs=rngs, sharding=pool_sharding)
         self.blocks = nnx.List([
             DWABlock(config.d_A, config.r, config.S, config.d_k, config.N, config.D,
@@ -173,6 +174,7 @@ class DWAModel(nnx.Module):
         soft: bool = False,                    # True → soft dense pool (TPU training)
         hybrid: bool = False,                  # True → full JAX GEMM compute, top-k keep
         pallas: bool = False,                  # True → Pallas fused kernel + multi-chip TP
+        token_ids: jax.Array | None = None,    # (batch, seq) int32 — avoids one_hot for large vocab
         tp_axis: str | None = None,            # mesh axis name for all_gather ('tp' or None)
         mesh=None,                             # jax.sharding.Mesh — captured, not traced
     ):
@@ -181,7 +183,7 @@ class DWAModel(nnx.Module):
         # Resolve mesh: explicit arg > stored _mesh > None
         mesh = mesh if mesh is not None else self._mesh
 
-        h = self.part_a(x)  # returns h_A directly (no tuple)
+        h = self.part_a(x, token_ids=token_ids)  # returns h_A directly (no tuple)
 
         alpha_list, idx_list, sims_list, alpha_raw_list = [], [], [], []
         for block in self.blocks:

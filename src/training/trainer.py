@@ -129,27 +129,42 @@ def loss_fn(
     forced_idx: jax.Array,
     soft: bool,
     hybrid: bool,
+    token_ids: jax.Array | None = None,
 ):
     x       = batch[:, :-1]
     targets = batch[:, 1:]
 
     vocab_size = model.config.d_input
-    x_onehot   = jax.nn.one_hot(x, vocab_size)
-
+    use_embed = getattr(model.config, 'use_embedding', False)
     fwd_forced = forced_idx if (not use_sigmoid and not soft and not hybrid) else None
-    logits, aux = model(
-        x_onehot,
-        use_sigmoid=use_sigmoid,
-        lambda_sharp=lambda_sharp,
-        forced_idx=fwd_forced,
-        return_aux=True,
-        soft=soft,
-        hybrid=hybrid,
-    )
+
+    if use_embed and token_ids is not None:
+        x_ids = token_ids[:, :-1]
+        logits, aux = model(
+            None,
+            use_sigmoid=use_sigmoid,
+            lambda_sharp=lambda_sharp,
+            forced_idx=fwd_forced,
+            return_aux=True,
+            soft=soft,
+            hybrid=hybrid,
+            token_ids=x_ids,
+        )
+    else:
+        x_onehot = jax.nn.one_hot(x, vocab_size)
+        logits, aux = model(
+            x_onehot,
+            use_sigmoid=use_sigmoid,
+            lambda_sharp=lambda_sharp,
+            forced_idx=fwd_forced,
+            return_aux=True,
+            soft=soft,
+            hybrid=hybrid,
+        )
 
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     task_loss = -jnp.mean(
-        jnp.sum(jax.nn.one_hot(targets, vocab_size) * log_probs, axis=-1)
+        jnp.take_along_axis(log_probs, targets[:, :, None], axis=-1).squeeze(-1)
     )
 
     # Compute aux losses in phase-2 (hard) OR always in soft/hybrid mode
@@ -185,11 +200,13 @@ def train_step(
     forced_idx: jax.Array,
     hybrid: bool,
 ):
+    use_embed = getattr(model.config, 'use_embedding', False)
+    token_ids = batch if use_embed else None
     grad_fn = nnx.value_and_grad(
         loss_fn, argnums=nnx.DiffState(0, nnx.Param), has_aux=True
     )
     (total_loss, (metrics, aux)), grads = grad_fn(
-        model, batch, use_sigmoid, lambda_sharp, lambda_entropy_eff, forced_idx, soft, hybrid
+        model, batch, use_sigmoid, lambda_sharp, lambda_entropy_eff, forced_idx, soft, hybrid, token_ids
     )
     optimizer.update(model, grads)
 
