@@ -3,6 +3,21 @@ import jax.numpy as jnp
 from flax import nnx
 
 
+class Buffer(nnx.Variable):
+    """Non-trainable static buffer (RoPE freqs, causal masks, etc.).
+
+    Registered as an nnx.Variable so NNX passes it as a traced input
+    to @nnx.jit rather than closing over a concrete JAX array.  This
+    prevents XLA from embedding large constant tensors (e.g. a 2048×2048
+    causal mask) directly into the HLO graph, which bloats compile time
+    and triggers re-compilation whenever the Python closure changes.
+
+    Buffer values are intentionally excluded from nnx.Param scans and
+    optimizer state by virtue of not being nnx.Param subclasses.
+    """
+    pass
+
+
 # ─── RoPE helpers ─────────────────────────────────────────────────────────────
 
 def _rope_freqs(d_head: int, max_seq: int) -> jax.Array:
@@ -39,9 +54,11 @@ class CausalSelfAttention(nnx.Module):
         self.proj = nnx.Linear(d_model, d_model, use_bias=False, rngs=rngs)
         self.norm = nnx.LayerNorm(d_model, rngs=rngs)
 
-        # Pre-compute RoPE frequencies and causal mask (static — not parameters)
-        self._freqs = _rope_freqs(self.d_head, max_seq_len)
-        self._mask  = jnp.tril(jnp.ones((max_seq_len, max_seq_len), dtype=bool))
+        # Store as Buffer (nnx.Variable subclass) so NNX passes them as
+        # traced inputs to @nnx.jit instead of closing over concrete arrays.
+        # This removes 2×12 = 24 large HLO constants from the compiled graph.
+        self._freqs = Buffer(_rope_freqs(self.d_head, max_seq_len))
+        self._mask  = Buffer(jnp.tril(jnp.ones((max_seq_len, max_seq_len), dtype=bool)))
 
     def __call__(self, x: jax.Array) -> jax.Array:
         """x: (batch, seq, d_model) → (batch, seq, d_model)"""
@@ -55,12 +72,12 @@ class CausalSelfAttention(nnx.Module):
         v = v.reshape(B, T, H, D).transpose(0, 2, 1, 3)
 
         # RoPE on Q and K
-        q = _apply_rope(q, self._freqs)
-        k = _apply_rope(k, self._freqs)
+        q = _apply_rope(q, self._freqs.value)
+        k = _apply_rope(k, self._freqs.value)
 
         # Scaled dot-product with causal mask (mask pre-built in __init__)
         attn = jnp.einsum('bhsd,bhtd->bhst', q, k) * self.scale
-        attn = jnp.where(self._mask[:T, :T], attn, -1e9)
+        attn = jnp.where(self._mask.value[:T, :T], attn, -1e9)
         attn = jax.nn.softmax(attn, axis=-1)
 
         out = jnp.einsum('bhst,bhtd->bhsd', attn, v)    # (B, H, T, D)
@@ -72,16 +89,19 @@ class CausalSelfAttention(nnx.Module):
 
 class PartA(nnx.Module):
     """
-    Encoder half: maps input features → h_A (d_A) and produces per-position query z.
-    2-layer MLP with GELU + pre-norm, plus optional causal self-attention (n_heads>0)
-    for cross-position context, plus a projection head for z.
+    Encoder half: maps integer token ids → h_A (d_A) via embedding + MLP.
+
+    Uses nnx.Embed for the first projection instead of Linear + one_hot.
+    This eliminates the (B, T, d_input) one-hot tensor (e.g. 2 GB at
+    vocab=65000, B=16, T=512) from the HLO graph entirely.
     """
 
     def __init__(self, d_input: int, d_A: int, n_heads: int = 0,
                  max_seq_len: int = 256, rngs: nnx.Rngs = None):
         hidden = d_A * 4
-        self.norm_in  = nnx.LayerNorm(d_input, rngs=rngs)
-        self.fc1      = nnx.Linear(d_input, hidden, rngs=rngs)
+        # Embed replaces norm_in + fc1: token id → hidden directly.
+        # Same parameter count as Linear(d_input, hidden, use_bias=False).
+        self.embed    = nnx.Embed(num_embeddings=d_input, features=hidden, rngs=rngs)
         self.fc2      = nnx.Linear(hidden, d_A, rngs=rngs)
         self.norm_out = nnx.LayerNorm(d_A, rngs=rngs)
 
@@ -90,10 +110,10 @@ class PartA(nnx.Module):
 
     def __call__(self, x: jax.Array):
         """
-        x: (batch, [seq,] d_input) — token one-hots
-        Returns h_A (batch, [seq,] d_A).
+        x: (batch, seq) int32 token ids
+        Returns h_A (batch, seq, d_A).
         """
-        h   = jax.nn.gelu(self.fc1(self.norm_in(x)))
+        h   = jax.nn.gelu(self.embed(x))     # (B, T, hidden)
         h_A = self.norm_out(self.fc2(h))
 
         if self.attn is not None and h_A.ndim == 3:

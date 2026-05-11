@@ -262,12 +262,18 @@ def fused_topk_retrieval(
 
     use_pallas = _PALLAS_OK and _PALLAS_TPU_OK and platform == 'tpu'
 
+    # ── Build Pallas kernel ONCE outside the loop body ─────────────────────
+    # CRITICAL: calling _build_fused_topk_tpu_kernel inside _tile_step triggers
+    # pallas_call construction during every JIT trace, causing redundant Mosaic
+    # kernel lowering. Build it here so the kernel object is closed-over as a
+    # Python constant and reused across all fori_loop iterations.
     if use_pallas:
         block_bt = min(_TPU_BLOCK_BT, BT)
         pad_bt = (-BT) % block_bt
         BT_p = BT + pad_bt
         q_p = jnp.pad(q_flat, [(0, 0), (0, pad_bt), (0, 0)]) if pad_bt else q_flat
         gate_params = jnp.array([lambda_sharp, tau_scalar, T_inv], dtype=jnp.float32)
+        _tpu_kernel = _build_fused_topk_tpu_kernel(S, BT_p, tile_n, d_k, block_bt)
 
     def _tile_step(tile_idx, carry):
         heap_v, heap_i, sims_acc, ar_acc = carry
@@ -277,8 +283,7 @@ def fused_topk_retrieval(
         k_tile = lax.dynamic_slice(keys, (0, n_start, 0), (S, tile_n, d_k))  # (S, tile_n, d_k)
 
         if use_pallas:
-            kernel = _build_fused_topk_tpu_kernel(S, BT_p, tile_n, d_k, block_bt)
-            alpha_raw_tile_p, _, sims_tile_p, _ = kernel(q_p, k_tile, w, gate_params)
+            alpha_raw_tile_p, _, sims_tile_p, _ = _tpu_kernel(q_p, k_tile, w, gate_params)
             # Trim BT padding
             alpha_raw_tile = alpha_raw_tile_p[:BT]  # (BT, tile_n)
             sims_tile      = sims_tile_p[:BT]

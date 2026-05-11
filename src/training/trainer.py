@@ -212,12 +212,11 @@ def loss_fn(
     x       = batch[:, :-1]
     targets = batch[:, 1:]
 
-    vocab_size = model.config.d_input
-    x_onehot   = jax.nn.one_hot(x, vocab_size)
-
+    # Model now accepts int32 token ids directly (PartA uses nnx.Embed internally).
+    # Passing one-hots is no longer needed and would materialise a ~2 GB tensor.
     fwd_forced = forced_idx if (not use_sigmoid and not soft and not hybrid) else None
     logits, aux = model(
-        x_onehot,
+        x,
         use_sigmoid=use_sigmoid,
         lambda_sharp=lambda_sharp,
         forced_idx=fwd_forced,
@@ -227,8 +226,9 @@ def loss_fn(
     )
 
     log_probs = jax.nn.log_softmax(logits, axis=-1)
+    # take_along_axis avoids materialising the (B, T, vocab) one-hot target tensor.
     task_loss = -jnp.mean(
-        jnp.sum(jax.nn.one_hot(targets, vocab_size) * log_probs, axis=-1)
+        jnp.take_along_axis(log_probs, targets[..., None], axis=-1).squeeze(-1)
     )
 
     # Compute aux losses in phase-2 (hard) OR always in soft/hybrid mode
@@ -355,9 +355,9 @@ def generate(
             buffer, pos, rng = carry
             rng, subkey = jax.random.split(rng)
 
-            # Full forward pass on fixed-shape buffer -- compiles once
-            x_onehot = jax.nn.one_hot(buffer, d_input)  # (1, max_seq_len, d_input)
-            logits = model(x_onehot, use_sigmoid=True, lambda_sharp=5.0, soft=soft, hybrid=hybrid)
+            # Full forward pass on fixed-shape int buffer — compiles once
+            # Model accepts int32 token ids directly (no one_hot needed).
+            logits = model(buffer, use_sigmoid=True, lambda_sharp=5.0, soft=soft, hybrid=hybrid)
 
             # Sample at position pos (last real token predicts pos+1)
             next_logits = jax.lax.dynamic_slice(

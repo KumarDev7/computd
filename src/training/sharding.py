@@ -591,19 +591,22 @@ def make_pool_parallel_retrieve(ctx: MeshContext, k_max: int, T: float,
         local_vecs = jnp.where(in_shard[..., None], local_vecs, 0.0)
 
 
-        # Use lax.switch to select the static offsets for this pool shard.
-        # All branches compile identically; dead ones are eliminated by XLA DCE.
-        def _branch_fn(shard_rank):
-            off_V, off_b, end_b = shard_offsets[shard_rank]
-            return partial_uv_einsum(
-                h_A, local_vecs, alpha,
-                off_V, off_b, end_b,
-                d_B, 0, d_A,
-            )
-
-        h_delta_p, b_delta_p = lax.switch(
-            pool_rank,
-            [functools.partial(_branch_fn, i) for i in range(pool_size)],
+        # ── Replace lax.switch with a branch-free static-table lookup ───────
+        # lax.switch compiles ALL branches, generating pool_size × n_blocks
+        # copies of partial_uv_einsum in the HLO.  Instead we embed the
+        # per-shard offsets as small constant arrays and use lax.gather to
+        # select the right row at runtime — XLA folds these away at compile
+        # time because the values are static.
+        _off_V_arr = jnp.array([o[0] for o in shard_offsets], dtype=jnp.int32)
+        _off_b_arr = jnp.array([o[1] for o in shard_offsets], dtype=jnp.int32)
+        _end_b_arr = jnp.array([o[2] for o in shard_offsets], dtype=jnp.int32)
+        off_V = jnp.int32(_off_V_arr[pool_rank])
+        off_b = jnp.int32(_off_b_arr[pool_rank])
+        end_b = jnp.int32(_end_b_arr[pool_rank])
+        h_delta_p, b_delta_p = partial_uv_einsum(
+            h_A, local_vecs, alpha,
+            off_V, off_b, end_b,
+            d_B, 0, d_A,
         )
 
         # h_base: shard 0 contributes W_base; others return zeros.
@@ -718,12 +721,12 @@ def make_sharded_train_step(model, optimizer, cfg, ctx: MeshContext):
         local_keys = lax.psum(local_keys_partial, axis_name='pool')
         local_keys = local_keys / (jnp.linalg.norm(local_keys, axis=-1, keepdims=True) + 1e-8)
 
-        # Minimal PartA proxy: linear projection of x_oh (model.part_a is complex;
+        # Minimal PartA proxy: linear projection (model.part_a is complex;
         # we thread h through the outer jit and pass z here for simplicity).
         # NOTE: full PartA (multi-layer MLP + optional attn) must be computed
         # outside the shard_map on replicated weights, then z is passed in.
         # See _sharded_step below for the full two-stage pattern.
-        return jnp.array(0.0), x_oh[:, :, :1], x[:, :1].astype(jnp.int32), \
+        return jnp.array(0.0), x[:, :1, None], x[:, :1].astype(jnp.int32), \
                jnp.zeros((x.shape[0], N_local * pool_size)), \
                jnp.zeros((x.shape[0], N_local * pool_size))
 
@@ -767,18 +770,28 @@ def make_sharded_train_step(model, optimizer, cfg, ctx: MeshContext):
                      lambda_entropy_eff, forced_idx):
             x       = batch[:, :-1]
             targets = batch[:, 1:]
-            x_oh    = jax.nn.one_hot(x, vocab)
+            # PartA now uses nnx.Embed: pass int32 token ids directly.
+            # Eliminates the (B/data, T, vocab) one-hot tensor from the HLO.
 
-            # Stage 1: PartA + per-block query_proj (replicated weights)
-            h = model.part_a(x_oh)
+            # Stage 1: PartA (replicated Embed + MLP, no communication)
+            h = model.part_a(x)
             pool_vecs = model.pool.vectors.value
 
-            alpha_list, idx_list, sims_list, alpha_raw_list = [], [], [], []
+            # ── lax.scan over DWABlocks ─────────────────────────────────
+            # Stack all block Param arrays along axis-0, define a pure one-block
+            # function, and use lax.scan.  XLA compiles ONE block body instead of
+            # unrolling n_assembly_layers separate subgraphs into the HLO.
+            from src.model.dwa import _stack_block_params
+            stacked_params = _stack_block_params(model.blocks)
+            template_block = model.blocks[0]
 
-            for block in model.blocks:
+            def _block_scan(h_carry, block_params_i):
+                nnx.update(template_block, block_params_i)
+                block = template_block
+
                 if block.n_heads > 0:
-                    h = block.attn(h)
-                z = block.query_proj(h)
+                    h_carry = block.attn(h_carry)
+                z = block.query_proj(h_carry)
 
                 # Stage 2: pool-parallel retrieval (shard_map, both axes active)
                 alpha, top_idx, sims_seq, alpha_raw_seq = pool_retrieve(
@@ -790,43 +803,47 @@ def make_sharded_train_step(model, optimizer, cfg, ctx: MeshContext):
                     jnp.array(lambda_sharp),
                 )
 
-                # Sharded assembly: gathers D_local slice per chip, psums (B,T,d_B).
-                # Eliminates the 9 GB (B,T,k_max,D) gathered tensor entirely.
+                # Sharded assembly: D_local gather + psum — no 9 GB tensor.
                 h_precomputed = pool_assemble(
-                    h, pool_vecs, top_idx, alpha,
+                    h_carry, pool_vecs, top_idx, alpha,
                     block.assembler.W_base.value,
                     block.assembler.b_base.value,
                 )
-                h = block.assembler(h, alpha, top_idx, pool_vecs,
-                                    h_precomputed=h_precomputed)
+                h_out = block.assembler(h_carry, alpha, top_idx, pool_vecs,
+                                        h_precomputed=h_precomputed)
+                return h_out, (alpha, top_idx, sims_seq, alpha_raw_seq)
 
-                alpha_list.append(alpha)
-                idx_list.append(top_idx)
-                sims_list.append(sims_seq)
-                alpha_raw_list.append(alpha_raw_seq)
+            h, (alpha_stack, idx_stack, sims_stack, ar_stack) = lax.scan(
+                _block_scan, h, stacked_params
+            )
+            # lax.scan stacks outputs along axis-0: (n_layers, B/data, T, k_max)
 
             logits    = model.part_b(h)
             log_probs = jax.nn.log_softmax(logits, axis=-1)
+            # take_along_axis avoids the (B/data, T, vocab) one-hot target tensor.
             task_loss = -jnp.mean(
-                jnp.sum(jax.nn.one_hot(targets, vocab) * log_probs, axis=-1)
+                jnp.take_along_axis(log_probs, targets[..., None], axis=-1).squeeze(-1)
             )
 
-            # ── Gradient all-reduce across data axis ─────────────────────
-            # with_sharding_constraint forces the scalar loss to be replicated
-            # P() across all devices.  XLA/GSPMD inserts an all_reduce here.
-            # Autodiff of all_reduce = all_reduce of upstream grad →
-            # replicated-param grads are automatically all-reduced.
+            # ── Gradient all-reduce across data axis ─────────────────
             task_loss = lax.with_sharding_constraint(
                 task_loss, NamedSharding(mesh, P())
             )
 
+            # Reconstruct aux dicts from scanned stacks
+            n_layers   = idx_stack.shape[0]
+            alpha_list = [alpha_stack[i] for i in range(n_layers)]
+            idx_list   = [idx_stack[i]   for i in range(n_layers)]
+            sims_list  = [sims_stack[i]  for i in range(n_layers)]
+            ar_list    = [ar_stack[i]    for i in range(n_layers)]
+
             aux = {
-                "alpha":      alpha_list[-1],
-                "idx":        idx_list[-1],
-                "sims":       sims_list[-1],
-                "alpha_raw":  alpha_raw_list[-1],
-                "alpha_all":  alpha_list,
-                "idx_all":    idx_list,
+                "alpha":     alpha_list[-1],
+                "idx":       idx_list[-1],
+                "sims":      sims_list[-1],
+                "alpha_raw": ar_list[-1],
+                "alpha_all": alpha_list,
+                "idx_all":   idx_list,
             }
             aux_losses = compute_aux_losses(
                 model, aux["alpha"], aux["idx"], aux["sims"], aux["alpha_raw"],
