@@ -361,13 +361,18 @@ def _shard_tensor_parallel(model, ctx: "MeshContext") -> None:
         linear.kernel.value = _put(k, row)
         # bias replicated — added to the full output after psum
 
-    # PartA: fc1 col-par  (d_in=65, hidden=16384) → each core (65, 16384/p)
-    #        fc2 row-par  (hidden=16384, d_A=4096) → each core (16384/p, 4096)
-    _col(model.part_a.fc1)
+    # PartA: embed col-par  (vocab, hidden) → each core (vocab, hidden/p)
+    #        fc2   row-par  (hidden, d_A)   → each core (hidden/p, d_A)
+    # PartA previously had fc1 (Linear); it is now nnx.Embed whose weight
+    # is stored in .embedding (shape: vocab × hidden).  Shard the hidden
+    # (output) axis across pool cores — same column-parallel pattern.
+    emb = model.part_a.embed.embedding  # nnx.Param, shape (vocab, hidden)
+    if emb.value.shape[1] % pool_size == 0:
+        emb.value = _put(emb.value, col)   # (vocab, hidden/p) per core
     _row(model.part_a.fc2)
 
-    # PartB: fc1 col-par  (d_A=4096, hidden=16384) → each core (4096, 16384/p)
-    #        fc2 row-par  (hidden=16384, d_out=65)  → each core (16384/p, 65)
+    # PartB: fc1 col-par  (d_B, hidden) → each core (d_B, hidden/p)
+    #        fc2 row-par  (hidden, d_out) → each core (hidden/p, d_out)
     _col(model.part_b.fc1)
     _row(model.part_b.fc2)
 
@@ -392,8 +397,10 @@ def _shard_tensor_parallel(model, ctx: "MeshContext") -> None:
             tp_bytes += wq.nbytes // pool_size * 2  # rough bf16 savings
 
     # Report savings
+    # embed.embedding: (vocab, hidden) — col-par shards hidden axis
+    embed_params = model.part_a.embed.embedding.value.size * pool_size
     col_par_params = (
-        model.part_a.fc1.kernel.value.size * pool_size +  # full size
+        embed_params +
         model.part_b.fc1.kernel.value.size * pool_size
     )
     row_par_params = (
