@@ -17,7 +17,7 @@ import numpy as np
 
 os.environ.setdefault('JAX_ENABLE_X64', 'False')
 os.environ.setdefault('XLA_PYTHON_CLIENT_PREALLOCATE', 'true')
-os.environ.setdefault('JAX_DEBUG_NANS', 'True')
+os.environ.setdefault('JAX_DEBUG_NANS', 'False')
 os.environ.setdefault('JAX_LOG_COMPILES', 'False')
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -61,11 +61,14 @@ def format_params(n: int) -> str:
 
 def make_train_step(cfg, use_sigmoid: bool):
     use_embed = getattr(cfg, 'use_embedding', False)
+    soft = getattr(cfg, 'soft_train', False)
+    hybrid = getattr(cfg, 'hybrid_train', False)
 
-    @nnx.jit
-    def train_step(model, optimizer, batch, lambda_sharp, lambda_entropy_eff, forced_idx):
-        soft = getattr(cfg, 'soft_train', False)
-        hybrid = getattr(cfg, 'hybrid_train', False)
+    @jax.jit
+    def train_step(graphdef, state, opt_graphdef, opt_state, batch,
+                   lambda_sharp, lambda_entropy_eff, forced_idx):
+        model = nnx.merge(graphdef, state)
+        optimizer = nnx.merge(opt_graphdef, opt_state)
         token_ids = batch if use_embed else None
 
         grad_fn = nnx.value_and_grad(loss_fn, argnums=nnx.DiffState(0, nnx.Param), has_aux=True)
@@ -102,7 +105,9 @@ def make_train_step(cfg, use_sigmoid: bool):
 
         model.pool.update_ema(alpha_sum, cfg.beta_ema)
         metrics['loss'] = total_loss
-        return metrics
+        _, new_state = nnx.split(model)
+        _, new_opt_state = nnx.split(optimizer)
+        return metrics, new_state, new_opt_state
 
     return train_step
 
@@ -124,9 +129,15 @@ def train_loop_1b(
     print_header = True
     t_start = time.time()
 
+    graphdef, state = nnx.split(model)
+    opt_graphdef, opt_state = nnx.split(optimizer)
+
     for step, batch in zip(range(total_steps), data_iter):
         if isinstance(batch, tuple):
             batch = batch[0]
+
+        if step == 0:
+            print(f'[train] step 0: batch shape={batch.shape} dtype={batch.dtype}, compiling train step...')
 
         t0 = time.time()
         use_sigmoid, lambda_sharp, lambda_entropy_eff = get_phase_params(step, cfg)
@@ -136,10 +147,13 @@ def train_loop_1b(
         forced_idx = _rot.dummy() if (use_sigmoid or cfg.hybrid_train) else (_rot.next() if not use_sigmoid else _rot.dummy())
 
         train_fn = step_phase2 if use_sigmoid else step_phase1
-        metrics = train_fn(
-            model, optimizer, batch,
+        metrics, state, opt_state = train_fn(
+            graphdef, state, opt_graphdef, opt_state, batch,
             lambda_sharp, lambda_entropy_eff, forced_idx
         )
+
+        if step == 0:
+            print(f'[train] step 0 compiled and executed successfully')
 
         elapsed = time.time() - t0
         step_times.append(elapsed)
@@ -170,6 +184,7 @@ def train_loop_1b(
                 print(f'         aux detail: {aux_str}')
 
         if generate_every > 0 and step > 0 and step % generate_every == 0 and tokenizer is not None:
+            nnx.update(model, state)
             try:
                 prompt_tokens = tokenizer.encode(generate_prompt)
                 prompt_arr = jnp.array(prompt_tokens)[None, :]
@@ -178,6 +193,9 @@ def train_loop_1b(
                 print(f'\n  [{step}] >> {text[:200]}\n')
             except Exception as e:
                 print(f'  [{step}] generation failed: {e}')
+
+    nnx.update(model, state)
+    nnx.update(optimizer, opt_state)
 
     elapsed_total = time.time() - t_start
     print(f'\n[done] {total_steps} steps in {elapsed_total:.0f}s ({elapsed_total/60:.1f}min)')

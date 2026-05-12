@@ -188,10 +188,11 @@ def loss_fn(
 
 
 # use_sigmoid, soft, hybrid are static -> at most 8 jit compilations over full training
-@nnx.jit(static_argnums=(3, 4, 8))
+# Uses jax.jit + nnx.split/merge to avoid nnx.jit recompilation on every call.
+# The graphdef (model structure) is stable across steps, only state arrays change.
+@jax.jit
 def train_step(
-    model: nnx.Module,
-    optimizer: nnx.Optimizer,
+    graphdef, state, opt_graphdef, opt_state,
     batch: jax.Array,
     use_sigmoid: bool,
     soft: bool,
@@ -200,6 +201,8 @@ def train_step(
     forced_idx: jax.Array,
     hybrid: bool,
 ):
+    model = nnx.merge(graphdef, state)
+    optimizer = nnx.merge(opt_graphdef, opt_state)
     use_embed = getattr(model.config, 'use_embedding', False)
     token_ids = batch if use_embed else None
     grad_fn = nnx.value_and_grad(
@@ -244,7 +247,10 @@ def train_step(
 
     model.pool.update_ema(alpha_sum, model.config.beta_ema)
     metrics["loss"] = total_loss
-    return metrics
+
+    _, new_state = nnx.split(model)
+    _, new_opt_state = nnx.split(optimizer)
+    return metrics, new_state, new_opt_state
 
 
 # --- Text generation via lax.scan (JIT-compiled, no Python loop) -----------------
