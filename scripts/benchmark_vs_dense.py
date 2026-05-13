@@ -24,9 +24,9 @@ from flax import nnx
 from configs.shakespeare import get_shakespeare_config
 from src.model.dwa import DWAModel
 from src.model.dense_lm import DenseLM, make_dense_configs
-from src.training.trainer import (make_optimizer, train_step,
-                                   get_phase_params, Phase1Rotator,
-                                   reset_dead_vectors)
+from src.training.trainer import (make_optimizer, make_train_step,
+                                    get_phase_params, Phase1Rotator,
+                                    reset_dead_vectors)
 from src.data.text_loader import shakespeare_loader, CharTokenizer
 
 # ── Settings ──────────────────────────────────────────────────────────────────
@@ -110,7 +110,9 @@ def generate_text(model, model_type: str, tok: CharTokenizer,
 # ── Per-model training run ────────────────────────────────────────────────────
 
 def run_model(name: str, model, model_type: str, optimizer, tok,
-              data_gen, rotator=None, rng_np=None, cfg=None):
+              data_gen, rotator=None, rng_np=None, cfg=None,
+              graphdef=None, state=None, opt_graphdef=None, opt_state=None,
+              step_phase1=None, step_phase2=None):
     """Train one model and return (steps[], val_ppls[], thresholds{})."""
     steps_log, ppl_log = [], []
     thresholds = {t: None for t in PPL_THRESHOLDS}
@@ -128,8 +130,12 @@ def run_model(name: str, model, model_type: str, optimizer, tok,
             if cfg.reset_interval > 0 and step > 0 and step % cfg.reset_interval == 0:
                 resets += reset_dead_vectors(model, rng_np)
             use_s, lam, lent = get_phase_params(step, cfg)
+            step_fn = step_phase2 if use_s else step_phase1
             forced = rotator.next() if not use_s else rotator.dummy()
-            train_step(model, optimizer, batch, use_s, lam, lent, forced)
+            metrics, state, opt_state = step_fn(
+                graphdef, state, opt_graphdef, opt_state, batch,
+                jnp.float32(lam), jnp.float32(lent), forced
+            )
         else:
             dense_train_step(model, optimizer, batch)
 
@@ -181,12 +187,22 @@ def main():
     data_dwa = shakespeare_loader(DATA_PATH, BATCH_SIZE, SEQ_LEN,
                                   split="train", seed=SEED)
 
+    graphdef, state = nnx.split(dwa, nnx.Param)
+    opt_graphdef, opt_state = nnx.split(opt_dwa, nnx.Param)
+    step_phase1 = make_train_step(cfg, use_sigmoid=False)
+    step_phase2 = make_train_step(cfg, use_sigmoid=True)
+
     n_dwa = sum(x.size for x in jax.tree_util.tree_leaves(nnx.state(dwa, nnx.Param)))
     print(f"\n  DWA params:          {n_dwa:>10,}")
 
     steps, ppls, thresh = run_model(
         "DWA (pool=90%)", dwa, "dwa", opt_dwa, tok,
-        data_dwa, rotator=rot, rng_np=rng_np, cfg=cfg)
+        data_dwa, rotator=rot, rng_np=rng_np, cfg=cfg,
+        graphdef=graphdef, state=state, opt_graphdef=opt_graphdef, opt_state=opt_state,
+        step_phase1=step_phase1, step_phase2=step_phase2)
+
+    nnx.update(dwa, state)
+    nnx.update(opt_dwa, opt_state)
     results["DWA"] = dict(model=dwa, steps=steps, ppls=ppls,
                           thresh=thresh, n_params=n_dwa, type="dwa")
 

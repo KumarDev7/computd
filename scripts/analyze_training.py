@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from configs.small import DWAConfig
 from src.model.dwa import DWAModel
-from src.training.trainer import make_optimizer, train_step, get_phase_params
+from src.training.trainer import make_optimizer, make_train_step, get_phase_params
 from src.data.loader import synthetic_copy_task
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -53,6 +53,14 @@ config = DWAConfig()
 rngs   = nnx.Rngs(params=0, dropout=1)
 model  = DWAModel(config, rngs=rngs)
 optimizer = make_optimizer(model, config)
+
+# Split model and optimizer state for make_train_step
+graphdef, state = nnx.split(model)
+opt_graphdef, opt_state = nnx.split(optimizer)
+
+# Create step functions for both phases
+step_phase1 = make_train_step(config, use_sigmoid=False)
+step_phase2 = make_train_step(config, use_sigmoid=True)
 
 # Save initial pool vectors (numpy copy for movement tracking)
 pool_init = np.array(jax.device_get(model.pool.vectors.value))  # (N, D)
@@ -118,9 +126,14 @@ log_records = []
 
 for step, batch in zip(range(TOTAL_STEPS), train_iter):
     use_sigmoid, lambda_sharp = get_phase_params(step, config)
+    step_fn = step_phase2 if use_sigmoid else step_phase1
 
     # Training step
-    metrics = train_step(model, optimizer, batch, use_sigmoid, lambda_sharp)
+    forced_idx = jnp.zeros((BATCH_SIZE, config.k_max), dtype=jnp.int32)
+    metrics, state, opt_state = step_fn(
+        graphdef, state, opt_graphdef, opt_state, batch,
+        jnp.float32(lambda_sharp), jnp.float32(0.0), forced_idx
+    )
     metrics = jax.device_get(metrics)
 
     if step % LOG_EVERY == 0:
@@ -171,6 +184,10 @@ for step, batch in zip(range(TOTAL_STEPS), train_iter):
 
 print("-" * 90)
 print()
+
+# Restore model and optimizer state after training
+nnx.update(model, state)
+nnx.update(optimizer, opt_state)
 
 # ── Final evaluation on held-out test data ────────────────────────────────────
 print("=" * 70)

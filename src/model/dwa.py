@@ -29,7 +29,6 @@ def _retrieve_per_position(z, retrieval_module, pool_vectors, k_max, T, lambda_s
       • Full similarity GEMM computed, only top-k kept for assembly.
     """
     if hybrid and z.ndim == 3:
-        # Hybrid mode: full GEMM compute over all N, keep only top-k per position
         alpha, top_idx, sims, alpha_raw = retrieval_module.hybrid_forward(
             z, pool_vectors, k_max, T, lambda_sharp, use_sigmoid
         )
@@ -37,39 +36,22 @@ def _retrieve_per_position(z, retrieval_module, pool_vectors, k_max, T, lambda_s
 
     if z.ndim == 3:
         batch, seq, _ = z.shape
-
-        # Sequence-level query: mean over positions → one retrieval per sequence
-        z_seq = z.mean(axis=1)  # (batch, d_A)
-
+        z_seq = z.mean(axis=1)
         alpha_seq, idx, sims, alpha_raw = retrieval_module(
-            z=z_seq,
-            vectors=pool_vectors,
-            k_max=k_max,
-            T=T,
-            lambda_sharp=lambda_sharp,
-            use_sigmoid=use_sigmoid,
-            forced_idx=forced_idx,   # (batch, k_max) — same shape, no expansion needed
+            z=z_seq, vectors=pool_vectors, k_max=k_max, T=T,
+            lambda_sharp=lambda_sharp, use_sigmoid=use_sigmoid,
+            forced_idx=forced_idx,
         )
-        # idx: (batch, k_max), sims: (batch, N)
-
         if use_sigmoid:
-            # Per-position alpha: re-score each position against only the k retrieved vectors.
-            # Tiny gather (batch, k_max, D) instead of (batch, seq, k_max, D).
-            selected_vecs = pool_vectors[idx]                               # (batch, k_max, D)
-            alpha = retrieval_module.per_position_alpha(z, selected_vecs)  # (batch, seq, k_max)
+            selected_vecs = pool_vectors[idx]
+            alpha = retrieval_module.per_position_alpha(z, selected_vecs)
         else:
-            # Phase-1 warmup: uniform alpha, broadcast across positions
             alpha = jnp.broadcast_to(alpha_seq[:, None, :], (batch, seq, k_max))
-
         return alpha, idx, sims, alpha_raw
     else:
         return retrieval_module(
-            z=z,
-            vectors=pool_vectors,
-            k_max=k_max,
-            T=T,
-            lambda_sharp=lambda_sharp,
-            use_sigmoid=use_sigmoid,
+            z=z, vectors=pool_vectors, k_max=k_max, T=T,
+            lambda_sharp=lambda_sharp, use_sigmoid=use_sigmoid,
             forced_idx=forced_idx,
         )
 
@@ -105,25 +87,23 @@ class DWABlock(nnx.Module):
         z = self.query_proj(h)
 
         if soft and z.ndim == 3:
-            # Soft mode: all N vectors, pure GEMMs, no gather, no top-k.
             alpha, sims, alpha_raw = self.retrieval.soft_forward(
                 z, pool_vectors, T, lambda_sharp, use_sigmoid
             )
-            idx = None  # no discrete selection in soft mode
+            idx = None
         elif pallas and z.ndim == 3:
-            # Pallas hybrid: fused GEMM+gate+exp Pallas kernel + multi-chip all_gather.
             alpha, idx, sims, alpha_raw = self.retrieval.pallas_hybrid_forward(
                 z, pool_vectors, k_max, T, lambda_sharp, use_sigmoid, tp_axis=tp_axis, mesh=mesh
             )
         elif hybrid and z.ndim == 3:
-            # Pure-JAX hybrid mode: full GEMM compute, keep only top-k.
             alpha, idx, sims, alpha_raw = _retrieve_per_position(
                 z, self.retrieval, pool_vectors, k_max, T, lambda_sharp,
-                use_sigmoid, forced_idx, hybrid=True
+                use_sigmoid, None, hybrid=True
             )
         else:
             alpha, idx, sims, alpha_raw = _retrieve_per_position(
-                z, self.retrieval, pool_vectors, k_max, T, lambda_sharp, use_sigmoid, forced_idx
+                z, self.retrieval, pool_vectors, k_max, T, lambda_sharp,
+                use_sigmoid, forced_idx
             )
 
         h_out = self.assembler(h, alpha, idx, pool_vectors, mesh=mesh)
@@ -138,6 +118,10 @@ class DWAModel(nnx.Module):
       x → PartA → h_A
           [DWABlock_0 → ... → DWABlock_n-1]  (each: query_proj → retrieval → assembly)
           h → PartB → logits
+
+    TODO: Replace Python for loop with nnx.scan for ~n_layers× compilation speedup.
+    Blocked by: nnx.merge inside jax.lax.scan breaks with nnx.value_and_grad.
+    Once Flax NNX fixes this, re-enable the scan path.
     """
 
     def __init__(self, config, rngs: nnx.Rngs, mesh=None):
@@ -170,26 +154,22 @@ class DWAModel(nnx.Module):
         use_sigmoid: bool = False,
         lambda_sharp: float = 1.0,
         return_aux: bool = False,
-        forced_idx: jax.Array | None = None,  # (batch, k_max) for phase-1 warmup
-        soft: bool = False,                    # True → soft dense pool (TPU training)
-        hybrid: bool = False,                  # True → full JAX GEMM compute, top-k keep
-        pallas: bool = False,                  # True → Pallas fused kernel + multi-chip TP
-        token_ids: jax.Array | None = None,    # (batch, seq) int32 — avoids one_hot for large vocab
-        tp_axis: str | None = None,            # mesh axis name for all_gather ('tp' or None)
-        mesh=None,                             # jax.sharding.Mesh — captured, not traced
+        forced_idx: jax.Array | None = None,
+        soft: bool = False,
+        hybrid: bool = False,
+        pallas: bool = False,
+        token_ids: jax.Array | None = None,
+        tp_axis: str | None = None,
+        mesh=None,
     ):
         cfg       = self.config
         pool_vecs = self.pool.vectors.value
-        # Resolve mesh: explicit arg > stored _mesh > None
         mesh = mesh if mesh is not None else self._mesh
 
-        h = self.part_a(x, token_ids=token_ids)  # returns h_A directly (no tuple)
+        h = self.part_a(x, token_ids=token_ids)
 
         alpha_list, idx_list, sims_list, alpha_raw_list = [], [], [], []
         for block in self.blocks:
-            # jax.remat (gradient checkpointing) prevents XLA from scheduling all 18
-            # pool all-gathers (4.25 GiB each) simultaneously in the compiled HLO.
-            # Each block's all-gather is freed after forward and recomputed during backward.
             def _run_block(h, _b=block):
                 return _b(
                     h, pool_vecs, cfg.k_max, cfg.T, lambda_sharp, use_sigmoid, forced_idx,
@@ -205,11 +185,11 @@ class DWAModel(nnx.Module):
 
         if return_aux:
             return logits, {
-                "alpha":     alpha_list[-1],       # last block (backward compat for losses)
+                "alpha":     alpha_list[-1],
                 "idx":       idx_list[-1],
                 "sims":      sims_list[-1],
                 "alpha_raw": alpha_raw_list[-1],
-                "alpha_all": alpha_list,            # all blocks (for EMA update)
+                "alpha_all": alpha_list,
                 "idx_all":   idx_list,
                 "h_A":       h,
             }

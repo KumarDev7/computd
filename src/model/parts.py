@@ -56,7 +56,7 @@ class CausalSelfAttention(nnx.Module):
 
         self.norm = nnx.LayerNorm(d_model, rngs=rngs)
         self._freqs = _rope_freqs(self.d_head, max_seq_len)
-        self._mask  = jnp.tril(jnp.ones((max_seq_len, max_seq_len), dtype=bool))
+        self._mask  = jnp.tril(jnp.ones((max_seq_len, max_seq_len), dtype=jnp.float32))
 
     def __call__(self, x: jax.Array) -> jax.Array:
         """x: (batch, seq, d_model) → (batch, seq, d_model)"""

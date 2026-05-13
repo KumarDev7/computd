@@ -19,7 +19,7 @@ from flax import nnx
 
 from configs.small import DWAConfig
 from src.model.dwa import DWAModel
-from src.training.trainer import make_optimizer, train_step, get_phase_params, Phase1Rotator
+from src.training.trainer import make_optimizer, make_train_step, get_phase_params, Phase1Rotator
 from src.data.loader import synthetic_copy_task, bigram_task, make_bigram_table, random_token_batches
 
 
@@ -50,6 +50,11 @@ def train_and_eval(task_name, data_fn, eval_data_fn=None):
     data      = data_fn(VOCAB, BATCH, SEQ, seed=SEED)
     rotator   = Phase1Rotator(cfg.N, BATCH, cfg.k_max, seed=SEED)
 
+    graphdef, state = nnx.split(model)
+    opt_graphdef, opt_state = nnx.split(optimizer)
+    step_phase1 = make_train_step(cfg, use_sigmoid=False)
+    step_phase2 = make_train_step(cfg, use_sigmoid=True)
+
     # Pre-generate held-out test data using the eval generator (same transition table)
     test_data = [next(eval_data_fn(VOCAB, BATCH, SEQ, seed=SEED + i + 1)) for i in range(20)]
 
@@ -60,8 +65,12 @@ def train_and_eval(task_name, data_fn, eval_data_fn=None):
     for step in range(STEPS):
         batch = next(data)
         use_s, lam, lent = get_phase_params(step, cfg)
+        step_fn = step_phase2 if use_s else step_phase1
         forced = rotator.next() if not use_s else rotator.dummy()
-        train_step(model, optimizer, batch, use_s, lam, lent, forced)
+        metrics, state, opt_state = step_fn(
+            graphdef, state, opt_graphdef, opt_state, batch,
+            jnp.float32(lam), jnp.float32(lent), forced
+        )
 
         if step % 1000 == 0 or step == STEPS - 1:
             vocab = cfg.d_input
@@ -74,6 +83,8 @@ def train_and_eval(task_name, data_fn, eval_data_fn=None):
             loss  = -float(np.mean(np.sum(np.eye(vocab)[jax.device_get(tgts)] * lp, axis=-1)))
             print(f"  step={step:>5}  loss={loss:.4f}  acc={acc:.1f}%")
 
+    nnx.update(model, state)
+    nnx.update(optimizer, opt_state)
     results = full_eval(model, test_data, cfg)
     ret     = check_retrieval(model, test_data, cfg)
 

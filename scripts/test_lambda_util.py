@@ -23,7 +23,7 @@ from flax import nnx
 
 from configs.small import DWAConfig
 from src.model.dwa import DWAModel
-from src.training.trainer import make_optimizer, train_step, get_phase_params
+from src.training.trainer import make_optimizer, make_train_step, get_phase_params
 from src.data.loader import synthetic_copy_task
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -151,6 +151,11 @@ def run_experiment(lambda_util_val: float) -> RunResult:
     model = DWAModel(cfg, rngs=rngs)
     optimizer = make_optimizer(model, cfg)
 
+    graphdef, state = nnx.split(model, nnx.Param)
+    opt_graphdef, opt_state = nnx.split(optimizer, nnx.Param)
+    step_phase1 = make_train_step(cfg, use_sigmoid=False)
+    step_phase2 = make_train_step(cfg, use_sigmoid=True)
+
     data_iter = synthetic_copy_task(
         vocab_size=VOCAB_SIZE,
         batch_size=BATCH_SIZE,
@@ -206,9 +211,16 @@ def run_experiment(lambda_util_val: float) -> RunResult:
 
         if step < TOTAL_STEPS:
             use_sigmoid, lambda_sharp = get_phase_params(step, cfg)
+            step_fn = step_phase2 if use_sigmoid else step_phase1
             batch = next(data_iter)
-            train_step(model, optimizer, batch, use_sigmoid, lambda_sharp)
+            forced_idx = jnp.zeros((BATCH_SIZE, cfg.k_max), dtype=jnp.int32)
+            metrics, state, opt_state = step_fn(
+                graphdef, state, opt_graphdef, opt_state, batch,
+                jnp.float32(lambda_sharp), jnp.float32(0.0), forced_idx
+            )
 
+    nnx.update(model, state)
+    nnx.update(optimizer, opt_state)
     # Final held-out evaluation
     eval_iter = synthetic_copy_task(
         vocab_size=VOCAB_SIZE,

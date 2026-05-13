@@ -14,7 +14,7 @@ from flax import nnx
 
 from configs.small import DWAConfig
 from src.model.dwa import DWAModel
-from src.training.trainer import make_optimizer, train_step, get_phase_params, reset_dead_vectors
+from src.training.trainer import make_optimizer, make_train_step, get_phase_params, reset_dead_vectors
 from src.data.loader import synthetic_copy_task
 
 
@@ -79,6 +79,11 @@ def run(cfg, label):
     eval_data = synthetic_copy_task(VOCAB, BATCH, SEQ, seed=99)
     eval_batches = [next(eval_data) for _ in range(20)]
 
+    graphdef, state = nnx.split(model, nnx.Param)
+    opt_graphdef, opt_state = nnx.split(optimizer, nnx.Param)
+    step_phase1 = make_train_step(cfg, use_sigmoid=False)
+    step_phase2 = make_train_step(cfg, use_sigmoid=True)
+
     resets = 0
     snap   = {}
 
@@ -106,8 +111,15 @@ def run(cfg, label):
                         util=util, entr=entr)
 
         if step < STEPS:
-            train_step(model, optimizer, batch, use_s, lam, lent)
+            step_fn = step_phase2 if use_s else step_phase1
+            forced_idx = jnp.zeros((BATCH, cfg.k_max), dtype=jnp.int32)
+            metrics, state, opt_state = step_fn(
+                graphdef, state, opt_graphdef, opt_state, batch,
+                jnp.float32(lam), jnp.float32(lent), forced_idx
+            )
 
+    nnx.update(model, state)
+    nnx.update(optimizer, opt_state)
     test_ppl, test_acc = eval_metrics(model, eval_batches)
     ema   = jax.device_get(model.pool.ema_usage.value)
     alive = int((ema >= cfg.reset_threshold).sum())

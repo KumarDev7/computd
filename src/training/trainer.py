@@ -187,65 +187,58 @@ def loss_fn(
     return total_loss, (metrics, aux)
 
 
-# use_sigmoid, soft, hybrid are static -> at most 8 jit compilations over full training
-# Uses jax.jit + nnx.split/merge to avoid nnx.jit recompilation on every call.
-# The graphdef (model structure) is stable across steps, only state arrays change.
-@jax.jit
-def train_step(
-    graphdef, state, opt_graphdef, opt_state,
-    batch: jax.Array,
-    use_sigmoid: bool,
-    soft: bool,
-    lambda_sharp: float,
-    lambda_entropy_eff: float,
-    forced_idx: jax.Array,
-    hybrid: bool,
-):
-    model = nnx.merge(graphdef, state)
-    optimizer = nnx.merge(opt_graphdef, opt_state)
-    use_embed = getattr(model.config, 'use_embedding', False)
-    token_ids = batch if use_embed else None
-    grad_fn = nnx.value_and_grad(
-        loss_fn, argnums=nnx.DiffState(0, nnx.Param), has_aux=True
-    )
-    (total_loss, (metrics, aux)), grads = grad_fn(
-        model, batch, use_sigmoid, lambda_sharp, lambda_entropy_eff, forced_idx, soft, hybrid, token_ids
-    )
-    optimizer.update(model, grads)
+def make_train_step(cfg, use_sigmoid: bool):
+    use_embed = getattr(cfg, 'use_embedding', False)
+    soft = getattr(cfg, 'soft_train', False)
+    hybrid = getattr(cfg, 'hybrid_train', False)
 
-    # EMA update -- soft, hard, and hybrid modes have different alpha/idx shapes.
-    N         = model.pool.N
-    alpha_all = aux.get("alpha_all", [aux["alpha"]])
-    idx_all   = aux.get("idx_all",   [aux["idx"]])
-    n_blocks  = len(alpha_all)
+    @jax.jit
+    def train_step(graphdef, state, opt_graphdef, opt_state, batch,
+                   lambda_sharp, lambda_entropy_eff, forced_idx):
+        model = nnx.merge(graphdef, state)
+        optimizer = nnx.merge(opt_graphdef, opt_state)
+        token_ids = batch if use_embed else None
 
-    if idx_all[0] is None:
-        all_alpha = jnp.stack(alpha_all)
-        alpha_sum = all_alpha.mean(axis=(0, 1, 2))
-    elif idx_all[0].ndim == 3 and idx_all[0].shape[1] > 1:
-        all_idx   = jnp.stack(idx_all)
-        all_alpha = jnp.stack(alpha_all)
-        alpha_sum = jnp.zeros(N, dtype=jnp.float32).at[all_idx.reshape(-1)].add(
-            all_alpha.reshape(-1) / all_idx.size
+        grad_fn = nnx.value_and_grad(loss_fn, argnums=nnx.DiffState(0, nnx.Param), has_aux=True)
+        (total_loss, (metrics, aux)), grads = grad_fn(
+            model, batch, use_sigmoid, lambda_sharp, lambda_entropy_eff, forced_idx, soft, hybrid, token_ids
         )
-    else:
-        all_idx   = jnp.stack(idx_all)
+        optimizer.update(model, grads)
+
+        N = model.pool.N
+        alpha_all = aux.get('alpha_all', [aux['alpha']])
+        idx_all = aux.get('idx_all', [aux['idx']])
+        n_blocks = len(alpha_all)
+        batch_size = batch.shape[0]
+
         all_alpha = jnp.stack(alpha_all)
-        if all_idx.ndim == 3:
-            all_alpha = all_alpha.sum(axis=2)
-            denom = batch.shape[0] * n_blocks * alpha_all[0].shape[1]
+        all_idx = jnp.stack(idx_all)
+
+        if idx_all[0] is None:
+            alpha_sum = all_alpha.mean(axis=(0, 1, 2))
+        elif idx_all[0].ndim == 3 and idx_all[0].shape[1] > 1:
+            alpha_sum = jnp.zeros(N, dtype=jnp.float32).at[all_idx.reshape(-1)].add(
+                all_alpha.reshape(-1) / all_idx.size
+            )
         else:
-            denom = batch.shape[0] * n_blocks
-        alpha_sum = jnp.zeros(N, dtype=jnp.float32).at[all_idx.reshape(-1)].add(
-            all_alpha.reshape(-1) / denom
-        )
+            if all_idx.ndim == 3:
+                alpha_per_pos = all_alpha.sum(axis=2)
+                denom = batch_size * n_blocks * alpha_all[0].shape[1]
+            else:
+                alpha_per_pos = all_alpha
+                denom = batch_size * n_blocks
+            alpha_sum = jnp.zeros(N, dtype=jnp.float32).at[all_idx.reshape(-1)].add(
+                alpha_per_pos.reshape(-1) / denom
+            )
 
-    model.pool.update_ema(alpha_sum, model.config.beta_ema)
-    metrics["loss"] = total_loss
+        model.pool.update_ema(alpha_sum, cfg.beta_ema)
+        metrics['loss'] = total_loss
 
-    _, new_state = nnx.split(model)
-    _, new_opt_state = nnx.split(optimizer)
-    return metrics, new_state, new_opt_state
+        _, new_state = nnx.split(model)
+        _, new_opt_state = nnx.split(optimizer)
+        return metrics, new_state, new_opt_state
+
+    return train_step
 
 
 # --- Text generation via lax.scan (JIT-compiled, no Python loop) -----------------
@@ -353,22 +346,24 @@ def train_loop(
     hybrid   = getattr(cfg, 'hybrid_train', False)
     rng      = np.random.default_rng(seed)
     resets   = 0
-    _rotator = None  # lazily init with real batch size on first step
+    _rotator = None
+
+    graphdef, state = nnx.split(model)
+    opt_graphdef, opt_state = nnx.split(optimizer)
+
+    step_phase1 = make_train_step(cfg, use_sigmoid=False)
+    step_phase2 = make_train_step(cfg, use_sigmoid=True)
 
     for step, batch in zip(range(total_steps), data_iter):
-        # Unwrap (batch_array, tokenizer) tuples from shakespeare_loader
         if isinstance(batch, tuple):
             batch = batch[0]
         t0 = time.time()
 
-        # Codebook resets only in hard mode -- soft/hybrid mode gives every vector
-        # gradients each step, so low EMA just means natural sparsity, not death.
         if not soft and not hybrid and cfg.reset_interval > 0 and step > 0 and step % cfg.reset_interval == 0:
             resets += reset_dead_vectors(model, rng)
 
         use_sigmoid, lambda_sharp, lambda_entropy_eff = get_phase_params(step, cfg)
 
-        # Rotator only needed in hard mode (soft/hybrid don't use forced_idx in phase 1 warmup)
         if not soft and not hybrid:
             if _rotator is None:
                 _rotator = Phase1Rotator(cfg.N, batch.shape[0], cfg.k_max, seed=seed)
@@ -376,13 +371,14 @@ def train_loop(
         else:
             if _rotator is None:
                 _rotator = Phase1Rotator(cfg.N, batch.shape[0], cfg.k_max, seed=seed)
-            forced_idx = _rotator.dummy()  # ignored by soft/hybrid forward
+            forced_idx = _rotator.dummy()
 
-        metrics = train_step(
-            model, optimizer, batch,
-            use_sigmoid, soft, lambda_sharp, lambda_entropy_eff, forced_idx, hybrid
+        train_fn = step_phase2 if use_sigmoid else step_phase1
+        metrics, state, opt_state = train_fn(
+            graphdef, state, opt_graphdef, opt_state, batch,
+            jnp.float32(lambda_sharp), jnp.float32(lambda_entropy_eff), forced_idx
         )
-        # device_get only at log points -- keeps GPU async between steps
+
         if step % log_every == 0:
             m = jax.device_get(metrics)
             mode = "soft" if soft else "hybrid" if hybrid else "hard"
@@ -393,13 +389,16 @@ def train_loop(
             msg.append(f"t={int((time.time()-t0)*1000)}ms")
             print("  ".join(msg))
 
-        # Periodic text generation
         if generate_every > 0 and step > 0 and step % generate_every == 0 and tokenizer is not None:
+            nnx.update(model, state)
             prompt = generate_prompt if generate_prompt else ""
-            prompt_tokens = jnp.array(tokenizer.encode(prompt))[None, :]  # (1, seq_len)
+            prompt_tokens = jnp.array(tokenizer.encode(prompt))[None, :]
             if prompt_tokens.shape[1] == 0:
                 prompt_tokens = jnp.zeros((1, 1), dtype=jnp.int32)
             out = generate(model, prompt_tokens, generate_max_tokens,
                            temperature=generate_temperature, soft=soft, hybrid=hybrid)
             text = tokenizer.decode(out[0])
             print(f"  [{step}] >> {text}")
+
+    nnx.update(model, state)
+    nnx.update(optimizer, opt_state)

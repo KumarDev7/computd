@@ -22,7 +22,7 @@ from flax import nnx
 
 from configs.shakespeare import get_shakespeare_config
 from src.model.dwa import DWAModel
-from src.training.trainer import make_optimizer, train_step, get_phase_params, Phase1Rotator, reset_dead_vectors
+from src.training.trainer import make_optimizer, make_train_step, get_phase_params, Phase1Rotator, reset_dead_vectors
 from src.data.text_loader import shakespeare_loader, CharTokenizer
 
 # ── Settings ──────────────────────────────────────────────────────────────────
@@ -107,10 +107,11 @@ def main():
     rotator  = Phase1Rotator(cfg.N, BATCH_SIZE, cfg.k_max, seed=SEED)
     resets   = 0
 
-    # Show initial generation (random model)
-    print("\n[Step 0 — untrained model]")
-    print(generate(model, tok, prompt="HAMLET:\n", max_new=200))
-    print()
+    graphdef, state = nnx.split(model)
+    opt_graphdef, opt_state = nnx.split(optimizer)
+
+    step_fn_p1 = make_train_step(cfg, use_sigmoid=False)
+    step_fn_p2 = make_train_step(cfg, use_sigmoid=True)
 
     best_val = float("inf")
     t_start  = time.time()
@@ -118,17 +119,26 @@ def main():
     for step in range(TOTAL_STEPS):
         batch, tok = next(data_gen)
 
-        # Codebook reset
         if cfg.reset_interval > 0 and step > 0 and step % cfg.reset_interval == 0:
+            nnx.update(model, state)
+            nnx.update(optimizer, opt_state)
             resets += reset_dead_vectors(model, rng_np)
+            _, state = nnx.split(model)
+            _, opt_state = nnx.split(optimizer)
 
         use_s, lam, lent = get_phase_params(step, cfg)
         forced = rotator.next() if not use_s else rotator.dummy()
-        metrics = train_step(model, optimizer, batch, use_s, lam, lent, forced)
+        train_fn = step_fn_p2 if use_s else step_fn_p1
+        metrics, state, opt_state = train_fn(
+            graphdef, state, opt_graphdef, opt_state, batch,
+            jnp.float32(lam), jnp.float32(lent), forced
+        )
 
         if step % LOG_EVERY == 0 or step == TOTAL_STEPS - 1:
             metrics = jax.device_get(metrics)
-            vloss   = val_loss(model, tok)
+            nnx.update(model, state)
+            nnx.update(optimizer, opt_state)
+            vloss = val_loss(model, tok)
             elapsed = time.time() - t_start
             phase   = 1 if step < cfg.phase1_end else (2 if step < cfg.phase2_end else 3)
             print(f"  step={step:>6}  phase={phase}  "
@@ -137,6 +147,7 @@ def main():
             best_val = min(best_val, vloss)
 
         if (step + 1) % GEN_EVERY == 0:
+            nnx.update(model, state)
             print(f"\n{'─'*70}")
             print(f"[Step {step+1}] Generated text (temp=0.8, top_k=40):")
             print(f"{'─'*70}")
@@ -151,6 +162,9 @@ def main():
     print(f"\n{'═'*70}")
     print(f"  TRAINING COMPLETE  —  best val loss={best_val:.4f}  ppl={np.exp(best_val):.1f}")
     print(f"{'═'*70}")
+
+    nnx.update(model, state)
+    nnx.update(optimizer, opt_state)
 
     for temp in [0.7, 1.0]:
         print(f"\n── Temperature={temp} ──")

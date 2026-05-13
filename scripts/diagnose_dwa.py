@@ -23,7 +23,7 @@ import optax
 from configs.shakespeare import get_shakespeare_config
 from src.model.dwa import DWAModel
 from src.data.text_loader import shakespeare_loader
-from src.training.trainer import make_optimizer, train_step, get_phase_params, Phase1Rotator
+from src.training.trainer import make_optimizer, make_train_step, get_phase_params, Phase1Rotator
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -59,6 +59,11 @@ def train_with_probes(cfg, steps=STEPS):
     val_iter  = shakespeare_loader(DATA_PATH, BATCH, SEQ, split="val",   seed=SEED+99)
     rotator   = Phase1Rotator(cfg.N, BATCH, cfg.k_max, seed=SEED)
 
+    graphdef, state = nnx.split(model, nnx.Param)
+    opt_graphdef, opt_state = nnx.split(optimizer, nnx.Param)
+    step_phase1 = make_train_step(cfg, use_sigmoid=False)
+    step_phase2 = make_train_step(cfg, use_sigmoid=True)
+
     probe_at  = {0, 500, 1000, 2000, 3000, 4000, 5000}
     probes    = {}
 
@@ -71,7 +76,11 @@ def train_with_probes(cfg, steps=STEPS):
         forced = rotator.next() if not use_s else rotator.dummy()
 
         if step > 0:
-            metrics = train_step(model, optimizer, batch, use_s, lam, lent, forced)
+            step_fn = step_phase2 if use_s else step_phase1
+            metrics, state, opt_state = step_fn(
+                graphdef, state, opt_graphdef, opt_state, batch,
+                jnp.float32(lam), jnp.float32(lent), forced
+            )
 
         if step in probe_at:
             p = collect_probe(model, cfg, val_iter)
@@ -79,6 +88,8 @@ def train_with_probes(cfg, steps=STEPS):
             print(f"  {step:>6}  {p['task_loss']:>10.4f}  {p['val_ppl']:>8.3f}  "
                   f"{p['gamma']:>8.4f}  {p['dead_pct']:>6.1f}%  {p['alpha_entropy']:>8.3f}")
 
+    nnx.update(model, state)
+    nnx.update(optimizer, opt_state)
     return model, probes
 
 
