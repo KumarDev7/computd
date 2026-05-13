@@ -220,28 +220,23 @@ def train_step(
     n_blocks  = len(alpha_all)
 
     if idx_all[0] is None:
-        # Soft mode: alpha is (batch, seq, N) -- direct mean, no scatter needed.
-        all_alpha = jnp.stack(alpha_all)          # (n_blocks, batch, seq, N)
-        alpha_sum = all_alpha.mean(axis=(0, 1, 2)) # (N,) -- mean over blocks/batch/seq
+        all_alpha = jnp.stack(alpha_all)
+        alpha_sum = all_alpha.mean(axis=(0, 1, 2))
     elif idx_all[0].ndim == 3 and idx_all[0].shape[1] > 1:
-        # Hybrid mode (or hard per-position): idx is (batch, seq, k_max), alpha is (batch, seq, k_max)
-        # Scatter per-position alpha into N-dim using per-position idx.
-        all_idx   = jnp.stack(idx_all)    # (n_blocks, batch, seq, k_max)
-        all_alpha = jnp.stack(alpha_all)   # (n_blocks, batch, seq, k_max)
-        alpha_sum = jnp.zeros(N).at[all_idx.reshape(-1)].add(
-            all_alpha.reshape(-1) / (all_idx.size)
+        all_idx   = jnp.stack(idx_all)
+        all_alpha = jnp.stack(alpha_all)
+        alpha_sum = jnp.zeros(N, dtype=jnp.float32).at[all_idx.reshape(-1)].add(
+            all_alpha.reshape(-1) / all_idx.size
         )
     else:
-        # Hard mode (sequence-level): idx is (batch, k_max), alpha is (batch, seq, k_max)
-        all_idx   = jnp.stack(idx_all)    # (n_blocks, batch, k_max) or (n_blocks, batch, seq, k_max)
-        all_alpha = jnp.stack(alpha_all)   # matching shape
+        all_idx   = jnp.stack(idx_all)
+        all_alpha = jnp.stack(alpha_all)
         if all_idx.ndim == 3:
-            # Sequence-level idx: sum alpha over seq before scattering
             all_alpha = all_alpha.sum(axis=2)
             denom = batch.shape[0] * n_blocks * alpha_all[0].shape[1]
         else:
             denom = batch.shape[0] * n_blocks
-        alpha_sum = jnp.zeros(N).at[all_idx.reshape(-1)].add(
+        alpha_sum = jnp.zeros(N, dtype=jnp.float32).at[all_idx.reshape(-1)].add(
             all_alpha.reshape(-1) / denom
         )
 

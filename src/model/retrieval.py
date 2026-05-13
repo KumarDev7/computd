@@ -42,8 +42,8 @@ class MultiAspectRetrieval(nnx.Module):
         else:
             W_K_val = (jax.random.normal(rngs.params(), (S, d_k, D)) * (D ** -0.5)).astype(jnp.bfloat16)
         self.W_K = nnx.Param(W_K_val)
-        self.aspect_logits = nnx.Param(jnp.zeros(S))
-        self.tau = nnx.Param(jnp.zeros(S))
+        self.aspect_logits = nnx.Param(jnp.zeros(S, dtype=jnp.float32))
+        self.tau = nnx.Param(jnp.zeros(S, dtype=jnp.float32))
 
     def __call__(
         self,

@@ -39,7 +39,7 @@ class WeightAssembler(nnx.Module):
         self.b_base = nnx.Param(jnp.zeros(d_B, dtype=jnp.bfloat16))
 
         # LoRA-style residual scale — init 1.0 so pool contribution is immediately active
-        self.gamma = nnx.Param(jnp.array(1.0))
+        self.gamma = nnx.Param(jnp.array(1.0, dtype=jnp.float32))
 
         # LayerNorm after assembly
         self.norm = nnx.LayerNorm(d_B, rngs=rngs)

@@ -39,7 +39,7 @@ class VectorPool(nnx.Module):
             vectors = jax.random.normal(key, (N, D), dtype=jnp.bfloat16) * 0.02
         self.vectors = nnx.Param(vectors)
         # EMA of mean α per vector across batches — used in utilization loss
-        self.ema_usage = EMAState(jnp.zeros(N))
+        self.ema_usage = EMAState(jnp.zeros(N, dtype=jnp.float32))
 
     @property
     def N(self) -> int:

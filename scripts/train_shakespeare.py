@@ -10,6 +10,9 @@ Run:
 import os, sys, time
 os.environ["JAX_DEBUG_NANS"]   = "False"
 os.environ["JAX_LOG_COMPILES"] = "False"
+XLA_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".jax_cache")
+os.makedirs(XLA_CACHE_DIR, exist_ok=True)
+os.environ["JAX_COMPILATION_CACHE_DIR"] = XLA_CACHE_DIR
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np

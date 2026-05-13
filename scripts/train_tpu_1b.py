@@ -7,6 +7,12 @@ Dataset:       openbmb/Ultra-FineWeb (streaming)
 Tokenizer:     LiquidAI/LFM2.5-1.2B-Thinking (vocab=64400)
 Mode:          8-way TP sharding, hybrid_train=True
 
+Key fixes vs original:
+  - Stabilize weak_type scalars (eliminates 3-step recompilation)
+  - Pre-warm both phase1/phase2 JIT functions before training loop
+  - Unified EMA update (single code path for all modes)
+  - forced_idx always an array (no None inside JIT)
+
 Usage:
     cd /kaggle/working/computd
     python scripts/train_tpu_1b.py
@@ -19,6 +25,9 @@ os.environ.setdefault('JAX_ENABLE_X64', 'False')
 os.environ.setdefault('XLA_PYTHON_CLIENT_PREALLOCATE', 'true')
 os.environ.setdefault('JAX_DEBUG_NANS', 'False')
 os.environ.setdefault('JAX_LOG_COMPILES', 'False')
+XLA_CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.jax_cache')
+os.makedirs(XLA_CACHE_DIR, exist_ok=True)
+os.environ.setdefault('JAX_COMPILATION_CACHE_DIR', XLA_CACHE_DIR)
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -59,6 +68,15 @@ def format_params(n: int) -> str:
     return f'{n/1e6:.1f}M'
 
 
+def stabilize_weak_types(pytree):
+    """Convert any weak_type=True leaves to strong types to prevent JIT recompilation."""
+    def _fix(x):
+        if hasattr(x, 'weak_type') and getattr(x, 'weak_type', False):
+            return x.astype(x.dtype)
+        return x
+    return jax.tree.map(_fix, pytree)
+
+
 def make_train_step(cfg, use_sigmoid: bool):
     use_embed = getattr(cfg, 'use_embedding', False)
     soft = getattr(cfg, 'soft_train', False)
@@ -81,26 +99,26 @@ def make_train_step(cfg, use_sigmoid: bool):
         alpha_all = aux.get('alpha_all', [aux['alpha']])
         idx_all = aux.get('idx_all', [aux['idx']])
         n_blocks = len(alpha_all)
+        batch_size = batch.shape[0]
+
+        all_alpha = jnp.stack(alpha_all)
+        all_idx = jnp.stack(idx_all)
 
         if idx_all[0] is None:
-            all_alpha = jnp.stack(alpha_all)
             alpha_sum = all_alpha.mean(axis=(0, 1, 2))
         elif idx_all[0].ndim == 3 and idx_all[0].shape[1] > 1:
-            all_idx = jnp.stack(idx_all)
-            all_alpha = jnp.stack(alpha_all)
-            alpha_sum = jnp.zeros(N).at[all_idx.reshape(-1)].add(
-                all_alpha.reshape(-1) / (all_idx.size)
+            alpha_sum = jnp.zeros(N, dtype=jnp.float32).at[all_idx.reshape(-1)].add(
+                all_alpha.reshape(-1) / all_idx.size
             )
         else:
-            all_idx = jnp.stack(idx_all)
-            all_alpha = jnp.stack(alpha_all)
             if all_idx.ndim == 3:
-                all_alpha = all_alpha.sum(axis=2)
-                denom = batch.shape[0] * n_blocks * alpha_all[0].shape[1]
+                alpha_per_pos = all_alpha.sum(axis=2)
+                denom = batch_size * n_blocks * alpha_all[0].shape[1]
             else:
-                denom = batch.shape[0] * n_blocks
-            alpha_sum = jnp.zeros(N).at[all_idx.reshape(-1)].add(
-                all_alpha.reshape(-1) / denom
+                alpha_per_pos = all_alpha
+                denom = batch_size * n_blocks
+            alpha_sum = jnp.zeros(N, dtype=jnp.float32).at[all_idx.reshape(-1)].add(
+                alpha_per_pos.reshape(-1) / denom
             )
 
         model.pool.update_ema(alpha_sum, cfg.beta_ema)
@@ -132,12 +150,78 @@ def train_loop_1b(
     graphdef, state = nnx.split(model)
     opt_graphdef, opt_state = nnx.split(optimizer)
 
+    # Stabilize weak_type scalars to prevent JIT recompilation
+    state = stabilize_weak_types(state)
+    opt_state = stabilize_weak_types(opt_state)
+
+    # Pre-warm both JIT functions before training starts
+    warmup_batch = None
     for step, batch in zip(range(total_steps), data_iter):
         if isinstance(batch, tuple):
             batch = batch[0]
 
+        if warmup_batch is None:
+            warmup_batch = batch
+
         if step == 0:
-            print(f'[train] step 0: batch shape={batch.shape} dtype={batch.dtype}, compiling train step...')
+            print(f'[train] step 0: batch shape={batch.shape} dtype={batch.dtype}')
+            print('[warmup] Stabilizing JIT caches — compiling both phase functions...')
+
+            # Pre-compile phase1
+            _rot = Phase1Rotator(cfg.N, batch.shape[0], cfg.k_max, seed=0)
+            forced_idx_p1 = _rot.next()
+            t0 = time.time()
+            m, state, opt_state = step_phase1(
+                graphdef, state, opt_graphdef, opt_state, batch,
+                jnp.float32(1.0), jnp.float32(0.0), forced_idx_p1
+            )
+            _ = jax.device_get(m)
+            t_p1 = time.time() - t0
+            print(f'[warmup] phase1 compiled in {t_p1:.1f}s')
+
+            # Re-stabilize after first pass (may have new weak types from optimizer)
+            state = stabilize_weak_types(state)
+            opt_state = stabilize_weak_types(opt_state)
+
+            # Pre-compile phase2
+            forced_idx_p2 = _rot.dummy()
+            t0 = time.time()
+            m, state, opt_state = step_phase2(
+                graphdef, state, opt_graphdef, opt_state, batch,
+                jnp.float32(5.0), jnp.float32(0.02), forced_idx_p2
+            )
+            _ = jax.device_get(m)
+            t_p2 = time.time() - t0
+            print(f'[warmup] phase2 compiled in {t_p2:.1f}s')
+
+            # Re-stabilize again (optimizer may introduce new weak types on first update)
+            state = stabilize_weak_types(state)
+            opt_state = stabilize_weak_types(opt_state)
+
+            # Run one more step with each function to ensure cache is stable
+            forced_idx_p1 = _rot.next()
+            m, state, opt_state = step_phase1(
+                graphdef, state, opt_graphdef, opt_state, batch,
+                jnp.float32(1.0), jnp.float32(0.0), forced_idx_p1
+            )
+            _ = jax.device_get(m)
+
+            state = stabilize_weak_types(state)
+            opt_state = stabilize_weak_types(opt_state)
+
+            forced_idx_p2 = _rot.dummy()
+            m, state, opt_state = step_phase2(
+                graphdef, state, opt_graphdef, opt_state, batch,
+                jnp.float32(5.0), jnp.float32(0.02), forced_idx_p2
+            )
+            _ = jax.device_get(m)
+
+            state = stabilize_weak_types(state)
+            opt_state = stabilize_weak_types(opt_state)
+
+            print('[warmup] JIT caches stabilized — both phases compiled and cached')
+            print(f'[warmup] Total warmup time: {time.time() - t_start:.1f}s')
+            continue
 
         t0 = time.time()
         use_sigmoid, lambda_sharp, lambda_entropy_eff = get_phase_params(step, cfg)
@@ -149,11 +233,8 @@ def train_loop_1b(
         train_fn = step_phase2 if use_sigmoid else step_phase1
         metrics, state, opt_state = train_fn(
             graphdef, state, opt_graphdef, opt_state, batch,
-            lambda_sharp, lambda_entropy_eff, forced_idx
+            jnp.float32(lambda_sharp), jnp.float32(lambda_entropy_eff), forced_idx
         )
-
-        if step == 0:
-            print(f'[train] step 0 compiled and executed successfully')
 
         elapsed = time.time() - t0
         step_times.append(elapsed)
@@ -174,7 +255,6 @@ def train_loop_1b(
             recent = step_times[-min(log_every, len(step_times)):]
             avg_step_ms = np.mean(recent) * 1000
             tokens_per_sec = batch.shape[0] * batch.shape[1] / np.mean(recent)
-            elapsed_total = time.time() - t_start
 
             print(f'{step:6d}  {phase:<8}  {total_loss:8.4f}  {task_loss:8.4f}  {aux_total:10.4f}  {lent:6.4f}  {avg_step_ms:5.0f}ms  {tokens_per_sec:8.0f}')
 

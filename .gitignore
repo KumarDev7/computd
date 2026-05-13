@@ -9,5 +9,8 @@ wheels/
 # Virtual environments
 .venv
 
+# JAX XLA compilation cache
+.jax_cache/
+
 # OMC local state
 .omc/
